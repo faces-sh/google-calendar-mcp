@@ -1,5 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
+import { resolveArgs, wrapResult } from "./circuitBuffer.js";
 
 import { OAuth2Client } from "google-auth-library";
 import { readFileSync } from "fs";
@@ -383,8 +384,10 @@ export class GoogleCalendarMcpServer {
   private async executeWithHandler(handler: any, args: any): Promise<{ content: Array<{ type: "text"; text: string }> }> {
     await this.ensureAuthenticated();
 
-    const result = await handler.runTool(args, this.accounts);
-    return result;
+    // Circuit (docs/reqs/007): expand @@hN@@ handles in the args before the tool runs, and park a large result
+    // behind a handle on the way out. No-op without the circuit env, so the server still runs standalone.
+    const result = await handler.runTool(await resolveArgs(args), this.accounts);
+    return await wrapResult(result);
   }
 
   async start(): Promise<void> {
