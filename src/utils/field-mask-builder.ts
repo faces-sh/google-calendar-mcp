@@ -1,3 +1,4 @@
+import { localEnvelopeError } from "./failure-envelope.js";
 /**
  * Field mask builder for Google Calendar API partial response
  */
@@ -72,7 +73,11 @@ export function validateFields(fields: string[]): AllowedEventField[] {
   }
   
   if (invalidFields.length > 0) {
-    throw new Error(`Invalid fields requested: ${invalidFields.join(', ')}. Allowed fields: ${ALLOWED_EVENT_FIELDS.join(', ')}`);
+    throw localEnvelopeError(
+      'bad_request',
+      `Invalid fields requested: ${invalidFields.join(', ')}.`,
+      `Allowed fields: ${ALLOWED_EVENT_FIELDS.join(', ')}`
+    );
   }
   
   return validFields;

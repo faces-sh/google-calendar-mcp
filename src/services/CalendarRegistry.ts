@@ -3,6 +3,16 @@ import { calendar_v3, google } from 'googleapis';
 import { getCredentialsProjectId } from '../auth/utils.js';
 
 /**
+ * An account whose calendar list could not be read. Kept so that callers can report the real
+ * failure instead of reporting the account's calendars as absent (docs/MCP_FAILURE_ENVELOPE.md
+ * rule 6).
+ */
+export interface CalendarAccessFailure {
+  accountId: string;
+  error: unknown;
+}
+
+/**
  * Represents a calendar accessible from a specific account
  */
 export interface CalendarAccess {
@@ -46,6 +56,10 @@ export class CalendarRegistry {
 
   // Track in-flight requests to prevent duplicate API calls during concurrent access
   private inFlightRequests: Map<string, Promise<UnifiedCalendar[]>> = new Map();
+
+  // Accounts whose calendar list could not be read on the most recent fetch. A calendar missing
+  // because its account is broken must never be reported as a calendar that does not exist.
+  private lastAccessFailures: CalendarAccessFailure[] = [];
 
   /**
    * Get the singleton instance of CalendarRegistry
@@ -116,6 +130,19 @@ export class CalendarRegistry {
   }
 
   /**
+   * The accounts whose calendar list could not be read on the most recent fetch. Empty when every
+   * account answered.
+   */
+  getAccessFailures(): CalendarAccessFailure[] {
+    return this.lastAccessFailures;
+  }
+
+  /** The first account failure from the most recent fetch, if there was one. */
+  getLastAccessFailure(): CalendarAccessFailure | undefined {
+    return this.lastAccessFailures[0];
+  }
+
+  /**
    * Internal method to fetch calendars and build the unified registry
    */
   private async fetchAndBuildUnifiedCalendars(
@@ -123,6 +150,7 @@ export class CalendarRegistry {
     cacheKey: string
   ): Promise<UnifiedCalendar[]> {
     // Fetch calendars from all accounts in parallel
+    const failures: CalendarAccessFailure[] = [];
     const calendarsByAccount = await Promise.all(
       Array.from(accounts.entries()).map(async ([accountId, client]) => {
         try {
@@ -133,7 +161,9 @@ export class CalendarRegistry {
             calendars: response.data.items || []
           };
         } catch (error) {
-          // If one account fails, continue with others
+          // If one account fails, continue with the others, but REMEMBER the failure: an account
+          // that could not be read is a failure, not an account with no calendars.
+          failures.push({ accountId, error });
           return {
             accountId,
             calendars: [] as calendar_v3.Schema$CalendarListEntry[]
@@ -141,6 +171,13 @@ export class CalendarRegistry {
         }
       })
     );
+
+    this.lastAccessFailures = failures;
+
+    // Every account failed: there is no partial answer to give, so the failure is the answer.
+    if (failures.length > 0 && failures.length === accounts.size) {
+      throw failures[0].error;
+    }
 
     // Build calendar map: calendarId -> CalendarAccess[]
     const calendarMap = new Map<string, CalendarAccess[]>();

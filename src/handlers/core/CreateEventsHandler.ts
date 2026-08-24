@@ -6,6 +6,7 @@ import type { calendar_v3 } from 'googleapis';
 import { createTimeObject } from "../../utils/datetime.js";
 import { createStructuredResponse } from "../../utils/response-builder.js";
 import { CreateEventsResponse, convertGoogleEventToStructured, StructuredEvent } from "../../types/structured-responses.js";
+import { localEnvelopeError } from "../../utils/failure-envelope.js";
 
 export class CreateEventsHandler extends BaseToolHandler {
     async runTool(args: any, accounts: Map<string, OAuth2Client>): Promise<CallToolResult> {
@@ -37,6 +38,7 @@ export class CreateEventsHandler extends BaseToolHandler {
         const failed: Array<{ index: number; summary: string; error: string }> = [];
 
         // Circuit breaker: stop after 3 consecutive identical failures
+        let firstError: unknown;
         let consecutiveFailures = 0;
         let lastErrorMessage = '';
         const MAX_CONSECUTIVE_FAILURES = 3;
@@ -111,7 +113,7 @@ export class CreateEventsHandler extends BaseToolHandler {
                 });
 
                 if (!response.data) {
-                    throw new Error('Failed to create event, no data returned');
+                    throw localEnvelopeError('unexpected_response', 'Google accepted the event but returned nothing.');
                 }
 
                 created.push(
@@ -122,7 +124,13 @@ export class CreateEventsHandler extends BaseToolHandler {
                 consecutiveFailures = 0;
                 lastErrorMessage = '';
             } catch (error: unknown) {
-                const errorMessage = this.formatGoogleApiError(error);
+                if (firstError === undefined) {
+                    firstError = error;
+                }
+                // The action phrase must NOT name the event: the circuit breaker below compares
+                // consecutive failure text, and a per-event phrase would make every failure look
+                // different and stop it from ever tripping.
+                const errorMessage = this.formatGoogleApiError(error, 'create the event');
 
                 failed.push({
                     index: i,
@@ -160,12 +168,13 @@ export class CreateEventsHandler extends BaseToolHandler {
             ...(failed.length > 0 && { failed }),
         };
 
-        // When all events fail, signal error to the MCP client
-        if (created.length === 0) {
-            return {
-                ...createStructuredResponse(response),
-                isError: true,
-            };
+        // When every event failed, the answer is the failure itself, carrying the status line and
+        // Google's body from the first one (docs/MCP_FAILURE_ENVELOPE.md).
+        if (created.length === 0 && firstError !== undefined) {
+            const action = validArgs.events.length === 1
+                ? 'create the requested event'
+                : `create any of the ${validArgs.events.length} requested events`;
+            throw this.toEnvelopeError(firstError, action);
         }
 
         return createStructuredResponse(response);

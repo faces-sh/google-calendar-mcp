@@ -94,7 +94,7 @@ export class ListCalendarsHandler extends BaseToolHandler {
             const response = await calendar.calendarList.list();
             return response.data.items || [];
         } catch (error) {
-            throw this.handleGoogleApiError(error);
+            throw this.handleGoogleApiError(error, 'list the calendars');
         }
     }
 }

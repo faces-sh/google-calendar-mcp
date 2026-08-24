@@ -147,7 +147,7 @@ describe('Datetime Utilities', () => {
           createTimeObject(input, 'America/Los_Angeles');
           expect.fail('Expected error to be thrown');
         } catch (e: any) {
-          expect(e.message).toBe('Invalid JSON in time input');
+          expect(e.message).toBe('[bad_request] Invalid JSON in time input.');
           expect(e.message).not.toContain('sensitive-data-here');
         }
       });

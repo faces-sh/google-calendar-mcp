@@ -133,7 +133,7 @@ describe('GetEventHandler', () => {
 
       // Now throws an error instead of returning a message
       await expect(handler.runTool(args, mockAccounts)).rejects.toThrow(
-        "Event with ID 'nonexistent' not found in calendar 'primary'."
+        '[http_404] Could not read event "nonexistent": it was not found.'
       );
     });
 
@@ -165,7 +165,7 @@ describe('GetEventHandler', () => {
 
       // Now throws an error instead of returning a message
       await expect(handler.runTool(args, mockAccounts)).rejects.toThrow(
-        "Event with ID 'event123' not found in calendar 'primary'."
+        '[unexpected_response] Google returned no event for id "event123".'
       );
     });
   });

@@ -897,7 +897,7 @@ describe('UpdateEventHandler', () => {
       };
 
       await expect(handler.runTool(args, mockAccounts)).rejects.toThrow(
-        'Failed to update event'
+        '[unexpected_response] Google accepted the change but returned nothing.'
       );
     });
   });

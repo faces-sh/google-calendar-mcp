@@ -259,7 +259,7 @@ describe('CreateEventHandler', () => {
       };
 
       await expect(handler.runTool(args, mockAccounts)).rejects.toThrow(
-        "Event ID 'existing-event' already exists. Please use a different ID."
+        '[http_409] Could not create the event: it conflicts with something that already exists.\nHTTP 409 Conflict'
       );
     });
 
@@ -277,7 +277,7 @@ describe('CreateEventHandler', () => {
       };
 
       await expect(handler.runTool(args, mockAccounts)).rejects.toThrow(
-        "Event ID 'existing-event' already exists. Please use a different ID."
+        '[http_409] Could not create the event: it conflicts with something that already exists.\nHTTP 409 Conflict'
       );
     });
   });
@@ -672,7 +672,7 @@ describe('CreateEventHandler', () => {
       };
 
       await expect(handler.runTool(args, mockAccounts)).rejects.toThrow(
-        'Failed to create event, no data returned'
+        '[unexpected_response] Google accepted the event but returned nothing.'
       );
     });
   });
@@ -1173,7 +1173,7 @@ describe('CreateEventHandler', () => {
       };
 
       await expect(handler.runTool(args, mockAccounts)).rejects.toThrow(
-        'workingLocationProperties is required when eventType is "workingLocation"'
+        '[bad_request] A workingLocation event was requested without workingLocationProperties.'
       );
     });
   });

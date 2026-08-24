@@ -408,7 +408,7 @@ describe('list-events Registration Flow (Schema + HandlerFunction)', () => {
             timeMax: '2024-01-02T00:00:00'
           };
 
-          await expect(handlerFunction(input)).rejects.toThrow('Invalid JSON format for calendarId');
+          await expect(handlerFunction(input)).rejects.toThrow('[bad_request] The calendarId argument was not a calendar id or a list of calendar ids.');
         });
 
         it('should reject JSON arrays with non-string elements', async () => {

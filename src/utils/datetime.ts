@@ -1,3 +1,4 @@
+import { localEnvelopeError } from "./failure-envelope.js";
 /**
  * Datetime utilities for Google Calendar MCP Server
  * Provides timezone handling and datetime conversion utilities
@@ -33,7 +34,7 @@ export function convertToRFC3339(datetime: string, fallbackTimezone: string): st
             // Parse the datetime components
             const match = datetime.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})$/);
             if (!match) {
-                throw new Error('Invalid datetime format');
+                throw localEnvelopeError('bad_request', 'Invalid datetime format.');
             }
             
             const [, year, month, day, hour, minute, second] = match.map(Number);
@@ -125,7 +126,7 @@ export function createTimeObject(input: string, fallbackTimezone: string): { dat
             const obj: ParsedTimeObject = JSON.parse(trimmedInput);
 
             if (obj.date !== undefined && obj.dateTime !== undefined) {
-                throw new Error("Cannot specify both 'date' and 'dateTime' in time input");
+                throw localEnvelopeError('bad_request', "Cannot specify both 'date' and 'dateTime' in time input.");
             }
             if (obj.date) {
                 // All-day event via JSON object format
@@ -135,10 +136,10 @@ export function createTimeObject(input: string, fallbackTimezone: string): { dat
                 // Validate timeZone type and value if provided
                 if (obj.timeZone !== undefined) {
                     if (typeof obj.timeZone !== 'string') {
-                        throw new Error("timeZone must be a string (IANA timezone, e.g., 'America/Los_Angeles')");
+                        throw localEnvelopeError('bad_request', "timeZone must be a string (IANA timezone, e.g., 'America/Los_Angeles').");
                     }
                     if (obj.timeZone.trim() === '') {
-                        throw new Error("timeZone cannot be empty - provide a valid IANA timezone (e.g., 'America/Los_Angeles') or omit the field");
+                        throw localEnvelopeError('bad_request', "timeZone cannot be empty: provide a valid IANA timezone (e.g., 'America/Los_Angeles') or omit the field.");
                     }
                 }
                 // Timed event via JSON object format
@@ -154,10 +155,10 @@ export function createTimeObject(input: string, fallbackTimezone: string): { dat
                 }
             }
             // Shouldn't reach here if schema validation works, but fallback just in case
-            throw new Error('Invalid time object: must have either dateTime or date');
+            throw localEnvelopeError('bad_request', 'Invalid time object: must have either dateTime or date.');
         } catch (e) {
             if (e instanceof SyntaxError) {
-                throw new Error('Invalid JSON in time input');
+                throw localEnvelopeError('bad_request', 'Invalid JSON in time input.');
             }
             throw e;
         }

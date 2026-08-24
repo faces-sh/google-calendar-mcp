@@ -25,6 +25,8 @@ describe('CreateEventHandler - multi-account selection', () => {
     // Reset the singleton to get a fresh instance for each test
     CalendarRegistry.resetInstance();
     handler = new CreateEventHandler();
+    // getCalendarTimezone hits the calendar API; these tests are about account selection.
+    vi.spyOn(handler as any, 'getCalendarTimezone').mockResolvedValue('America/Los_Angeles');
     workClient = new OAuth2Client();
     personalClient = new OAuth2Client();
     accounts = new Map([
@@ -85,11 +87,12 @@ describe('CreateEventHandler - multi-account selection', () => {
     expect(response.event.accountId).toBe('personal');
   });
 
-  it('errors when no account has write access and none is specified', async () => {
-    // Don't mock getClientWithAutoSelection - let it fail naturally by not finding the calendar
-    // The CalendarRegistry singleton is reset in beforeEach, so it will try to fetch calendars
-    // which will fail since there are no real credentials
-
-    await expect(handler.runTool(baseArgs, accounts)).rejects.toThrow(/No account has write access/i);
+  it('surfaces the real account failure instead of calling the calendar missing', async () => {
+    // Don't mock getClientWithAutoSelection - let it fail naturally.
+    // Every account's calendar list fails (there are no real credentials here). That used to be
+    // swallowed into an empty calendar list, and the user was told "no account has write access
+    // to that calendar" when the truth was that their accounts could not be read at all
+    // (docs/MCP_FAILURE_ENVELOPE.md rule 6).
+    await expect(handler.runTool(baseArgs, accounts)).rejects.toThrow(/No access, refresh token/i);
   });
 });

@@ -1,4 +1,4 @@
-import { CallToolResult, McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
+import { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { OAuth2Client } from "google-auth-library";
 import { CreateEventInput } from "../../tools/registry.js";
 import { BaseToolHandler } from "./BaseToolHandler.js";
@@ -9,6 +9,7 @@ import { ConflictDetectionService } from "../../services/conflict-detection/inde
 import { CONFLICT_DETECTION_CONFIG } from "../../services/conflict-detection/config.js";
 import { createStructuredResponse, convertConflictsToStructured, createWarningsArray } from "../../utils/response-builder.js";
 import { CreateEventResponse, convertGoogleEventToStructured } from "../../types/structured-responses.js";
+import { localEnvelopeError } from "../../utils/failure-envelope.js";
 
 export class CreateEventHandler extends BaseToolHandler {
     private conflictDetectionService: ConflictDetectionService;
@@ -34,9 +35,9 @@ export class CreateEventHandler extends BaseToolHandler {
         if (validArgs.eventType === 'outOfOffice' || validArgs.eventType === 'workingLocation') {
             if (resolvedCalendarId !== 'primary' && !resolvedCalendarId.includes('@')) {
                 const eventTypeName = validArgs.eventType === 'outOfOffice' ? 'Out of Office' : 'Working Location';
-                throw new Error(
-                    `${eventTypeName} events can only be created on the primary calendar. ` +
-                    'Use calendarId: "primary" or your email address.'
+                throw localEnvelopeError(
+                    'bad_request',
+                    `${eventTypeName} events can only be created on the primary calendar, and "${resolvedCalendarId}" is not it.`
                 );
             }
         }
@@ -71,11 +72,10 @@ export class CreateEventHandler extends BaseToolHandler {
         );
 
         if (exactDuplicate && validArgs.allowDuplicates !== true) {
-            // Throw an error that will be handled by MCP SDK
-            throw new Error(
-                `Duplicate event detected (${Math.round(exactDuplicate.event.similarity * 100)}% similar). ` +
-                `Event "${exactDuplicate.event.title}" already exists. ` +
-                `To create anyway, set allowDuplicates to true.`
+            throw localEnvelopeError(
+                'duplicate_event',
+                `The event was not created because "${exactDuplicate.event.title}" already exists and is ${Math.round(exactDuplicate.event.similarity * 100)}% similar.`,
+                `Set allowDuplicates to true to create it anyway.`
             );
         }
 
@@ -157,14 +157,14 @@ export class CreateEventHandler extends BaseToolHandler {
                 ...(supportsAttachments && { supportsAttachments })
             });
             
-            if (!response.data) throw new Error('Failed to create event, no data returned');
+            if (!response.data) {
+                throw localEnvelopeError('unexpected_response', 'Google accepted the event but returned nothing.');
+            }
             return response.data;
         } catch (error: any) {
-            // Handle ID conflict errors specifically
-            if (error?.code === 409 || error?.response?.status === 409) {
-                throw new Error(`Event ID '${args.eventId}' already exists. Please use a different ID.`);
-            }
-            throw this.handleGoogleApiError(error);
+            // A 409 (the event id is taken) is an ordinary HTTP failure and keeps Google's body,
+            // which used to be replaced by an invented sentence.
+            throw this.handleGoogleApiError(error, 'create the event');
         }
     }
 
@@ -212,7 +212,10 @@ export class CreateEventHandler extends BaseToolHandler {
     private buildWorkingLocationProperties(args: CreateEventInput): calendar_v3.Schema$EventWorkingLocationProperties {
         const props = args.workingLocationProperties;
         if (!props) {
-            throw new Error('workingLocationProperties is required when eventType is "workingLocation"');
+            throw localEnvelopeError(
+                'bad_request',
+                'A workingLocation event was requested without workingLocationProperties.'
+            );
         }
 
         const properties: calendar_v3.Schema$EventWorkingLocationProperties = {

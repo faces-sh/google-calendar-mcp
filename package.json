@@ -44,6 +44,7 @@
     "test:watch": "vitest src/tests/unit",
     "test:integration": "npm run test:integration:direct",
     "test:integration:direct": "npm run build && vitest run src/tests/integration/direct-integration.test.ts",
+    "test:no-credentials": "npm run build && vitest run src/tests/integration/no-credentials-stdio.test.ts",
     "test:integration:multi-account": "npm run build && vitest run src/tests/integration/multi-account.test.ts src/tests/integration/multi-account-integration.test.ts",
     "test:integration:claude": "npm run build && vitest run src/tests/integration/claude-mcp-integration.test.ts",
     "test:integration:openai": "npm run build && vitest run src/tests/integration/openai-mcp-integration.test.ts",

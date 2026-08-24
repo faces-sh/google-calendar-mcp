@@ -376,7 +376,7 @@ describe('GoogleCalendarMcpServer', () => {
       expect(payload.calendars[0].preferredAccount).toBe('work');
     });
 
-    it('wraps non-McpError exceptions in McpError', async () => {
+    it('carries the failure envelope out of a resource read', async () => {
       state.calendarRegistryGetUnifiedCalendars.mockRejectedValue(
         new Error('network failure')
       );
@@ -384,10 +384,11 @@ describe('GoogleCalendarMcpServer', () => {
       const callback = await initAndGetResourceCallback();
 
       await expect(callback()).rejects.toThrow(McpError);
-      await expect(callback()).rejects.toThrow('Failed to load calendar accounts: network failure');
+      await expect(callback()).rejects.toThrow('[internal_error] Could not load the connected accounts.');
+      await expect(callback()).rejects.toThrow('network failure');
     });
 
-    it('re-throws McpError instances directly', async () => {
+    it('carries an authentication failure envelope out of a resource read', async () => {
       state.tokenManagerLoadAllAccounts.mockResolvedValue(new Map());
       state.tokenManagerValidateTokens.mockResolvedValue(false);
 
@@ -402,14 +403,10 @@ describe('GoogleCalendarMcpServer', () => {
       )!;
       const callback = call[3];
 
-      // ensureAuthenticated will throw McpError because no accounts and no valid tokens
+      // ensureAuthenticated throws when there are no accounts and no valid tokens. A resource
+      // read has no isError flag, so the envelope travels as the error message.
       await expect(callback()).rejects.toThrow(McpError);
-      try {
-        await callback();
-      } catch (err) {
-        expect(err).toBeInstanceOf(McpError);
-        expect((err as McpError).code).toBe(ErrorCode.InvalidRequest);
-      }
+      await expect(callback()).rejects.toThrow('[no_credentials]');
     });
   });
 

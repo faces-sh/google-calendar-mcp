@@ -1,11 +1,17 @@
-import { CallToolResult, McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
+import { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { OAuth2Client } from "google-auth-library";
-import { GaxiosError } from 'gaxios';
 import { calendar_v3, google } from "googleapis";
 import { getCredentialsProjectId } from "../../auth/utils.js";
 import { CalendarRegistry } from "../../services/CalendarRegistry.js";
 import { validateAccountId } from "../../auth/paths.js";
 import { convertToRFC3339 } from "../../utils/datetime.js";
+import {
+    EnvelopeError,
+    envelopeErrorFor,
+    envelopeTextFor,
+    isEnvelopeError,
+    localEnvelopeError
+} from "../../utils/failure-envelope.js";
 
 
 export abstract class BaseToolHandler<TArgs = any> {
@@ -28,14 +34,14 @@ export abstract class BaseToolHandler<TArgs = any> {
      * @param accountId Optional account ID. If not provided, uses first available account.
      * @param accounts Map of available accounts
      * @returns OAuth2Client for the specified or first account
-     * @throws McpError if account is invalid or not found
+     * @throws EnvelopeError if account is invalid or not found
      */
     protected getClientForAccountOrFirst(accountId: string | undefined, accounts: Map<string, OAuth2Client>): OAuth2Client {
         // No accounts available
         if (accounts.size === 0) {
-            throw new McpError(
-                ErrorCode.InvalidRequest,
-                'No authenticated accounts available. Please run authentication first.'
+            throw localEnvelopeError(
+                'no_credentials',
+                'No Google account is connected to this server.'
             );
         }
 
@@ -45,18 +51,20 @@ export abstract class BaseToolHandler<TArgs = any> {
             try {
                 validateAccountId(normalizedId);
             } catch (error) {
-                throw new McpError(
-                    ErrorCode.InvalidRequest,
-                    error instanceof Error ? error.message : 'Invalid account ID'
+                throw localEnvelopeError(
+                    'bad_request',
+                    'The account name is not a valid account name.',
+                    error instanceof Error ? error.message : undefined
                 );
             }
 
             const client = accounts.get(normalizedId);
             if (!client) {
                 const availableAccounts = Array.from(accounts.keys()).join(', ');
-                throw new McpError(
-                    ErrorCode.InvalidRequest,
-                    `Account "${normalizedId}" not found. Available accounts: ${availableAccounts}`
+                throw localEnvelopeError(
+                    'account_not_found',
+                    `There is no connected account called "${normalizedId}".`,
+                    `Connected accounts: ${availableAccounts || 'none'}`
                 );
             }
             return client;
@@ -67,9 +75,9 @@ export abstract class BaseToolHandler<TArgs = any> {
         const firstAccountId = sortedAccountIds[0];
         const client = accounts.get(firstAccountId);
         if (!client) {
-            throw new McpError(
-                ErrorCode.InternalError,
-                'Failed to retrieve OAuth client'
+            throw localEnvelopeError(
+                'internal_error',
+                'The connected account could not be loaded.'
             );
         }
         return client;
@@ -80,14 +88,14 @@ export abstract class BaseToolHandler<TArgs = any> {
      * @param accountId Optional account ID. If not provided, uses single account if available.
      * @param accounts Map of available accounts
      * @returns OAuth2Client for the specified or default account
-     * @throws McpError if account is invalid or not found
+     * @throws EnvelopeError if account is invalid or not found
      */
     protected getClientForAccount(accountId: string | undefined, accounts: Map<string, OAuth2Client>): OAuth2Client {
         // No accounts available
         if (accounts.size === 0) {
-            throw new McpError(
-                ErrorCode.InvalidRequest,
-                'No authenticated accounts available. Please run authentication first.'
+            throw localEnvelopeError(
+                'no_credentials',
+                'No Google account is connected to this server.'
             );
         }
 
@@ -100,9 +108,10 @@ export abstract class BaseToolHandler<TArgs = any> {
             try {
                 validateAccountId(normalizedId);
             } catch (error) {
-                throw new McpError(
-                    ErrorCode.InvalidRequest,
-                    error instanceof Error ? error.message : 'Invalid account ID'
+                throw localEnvelopeError(
+                    'bad_request',
+                    'The account name is not a valid account name.',
+                    error instanceof Error ? error.message : undefined
                 );
             }
 
@@ -110,9 +119,10 @@ export abstract class BaseToolHandler<TArgs = any> {
             const client = accounts.get(normalizedId);
             if (!client) {
                 const availableAccounts = Array.from(accounts.keys()).join(', ');
-                throw new McpError(
-                    ErrorCode.InvalidRequest,
-                    `Account "${normalizedId}" not found. Available accounts: ${availableAccounts}`
+                throw localEnvelopeError(
+                    'account_not_found',
+                    `There is no connected account called "${normalizedId}".`,
+                    `Connected accounts: ${availableAccounts || 'none'}`
                 );
             }
 
@@ -124,9 +134,9 @@ export abstract class BaseToolHandler<TArgs = any> {
             // Single account - use it automatically
             const firstClient = accounts.values().next().value;
             if (!firstClient) {
-                throw new McpError(
-                    ErrorCode.InternalError,
-                    'Failed to retrieve OAuth client'
+                throw localEnvelopeError(
+                    'internal_error',
+                    'The connected account could not be loaded.'
                 );
             }
             return firstClient;
@@ -134,9 +144,10 @@ export abstract class BaseToolHandler<TArgs = any> {
 
         // Multiple accounts but no account specified - error
         const availableAccounts = Array.from(accounts.keys()).join(', ');
-        throw new McpError(
-            ErrorCode.InvalidRequest,
-            `Multiple accounts available (${availableAccounts}). You must specify the 'account' parameter to indicate which account to use.`
+        throw localEnvelopeError(
+            'account_required',
+            'More than one Google account is connected, so the account to use was ambiguous.',
+            `Connected accounts: ${availableAccounts}`
         );
     }
 
@@ -145,7 +156,7 @@ export abstract class BaseToolHandler<TArgs = any> {
      * @param accountIds Account ID(s) - string, string[], or undefined
      * @param accounts Map of available accounts
      * @returns Map of accountId to OAuth2Client for the specified accounts
-     * @throws McpError if any account is invalid or not found
+     * @throws EnvelopeError if any account is invalid or not found
      */
     protected getClientsForAccounts(
         accountIds: string | string[] | undefined,
@@ -153,9 +164,9 @@ export abstract class BaseToolHandler<TArgs = any> {
     ): Map<string, OAuth2Client> {
         // No accounts available
         if (accounts.size === 0) {
-            throw new McpError(
-                ErrorCode.InvalidRequest,
-                'No authenticated accounts available. Please run authentication first.'
+            throw localEnvelopeError(
+                'no_credentials',
+                'No Google account is connected to this server.'
             );
         }
 
@@ -177,18 +188,20 @@ export abstract class BaseToolHandler<TArgs = any> {
             try {
                 validateAccountId(normalizedId);
             } catch (error) {
-                throw new McpError(
-                    ErrorCode.InvalidRequest,
-                    error instanceof Error ? error.message : 'Invalid account ID'
+                throw localEnvelopeError(
+                    'bad_request',
+                    'The account name is not a valid account name.',
+                    error instanceof Error ? error.message : undefined
                 );
             }
 
             const client = accounts.get(normalizedId);
             if (!client) {
                 const availableAccounts = Array.from(accounts.keys()).join(', ');
-                throw new McpError(
-                    ErrorCode.InvalidRequest,
-                    `Account "${normalizedId}" not found. Available accounts: ${availableAccounts}`
+                throw localEnvelopeError(
+                    'account_not_found',
+                    `There is no connected account called "${normalizedId}".`,
+                    `Connected accounts: ${availableAccounts || 'none'}`
                 );
             }
 
@@ -254,7 +267,7 @@ export abstract class BaseToolHandler<TArgs = any> {
      * @param accounts Map of available accounts
      * @param operation 'read' or 'write' operation type
      * @returns OAuth2Client, selected account ID, resolved calendar ID, and whether it was auto-selected
-     * @throws McpError if account not found or no suitable account available
+     * @throws EnvelopeError if account not found or no suitable account available
      */
     protected async getClientWithAutoSelection(
         accountId: string | undefined,
@@ -285,21 +298,23 @@ export abstract class BaseToolHandler<TArgs = any> {
         );
 
         if (!resolution) {
+            // If an account could not be read at all, that failure is the real answer, not
+            // "the calendar does not exist" (rule 6: a failure must never be reported as an absence).
+            this.throwCalendarAccessFailureIfAny(`reach calendar "${calendarNameOrId}"`);
             const availableAccounts = Array.from(accounts.keys()).join(', ');
             const accessType = operation === 'write' ? 'write' : 'read';
-            throw new McpError(
-                ErrorCode.InvalidRequest,
-                `No account has ${accessType} access to calendar "${calendarNameOrId}". ` +
-                `Available accounts: ${availableAccounts}. Please ensure the calendar exists and ` +
-                `you have the necessary permissions, or specify the 'account' parameter explicitly.`
+            throw localEnvelopeError(
+                'calendar_not_found',
+                `No connected account has ${accessType} access to a calendar called "${calendarNameOrId}".`,
+                `Connected accounts: ${availableAccounts}`
             );
         }
 
         const client = accounts.get(resolution.accountId);
         if (!client) {
-            throw new McpError(
-                ErrorCode.InternalError,
-                `Failed to retrieve client for account "${resolution.accountId}"`
+            throw localEnvelopeError(
+                'internal_error',
+                `The connected account "${resolution.accountId}" could not be loaded.`
             );
         }
 
@@ -324,131 +339,25 @@ export abstract class BaseToolHandler<TArgs = any> {
     }
 
     /**
-     * Format a Google API error into a human-readable message without throwing.
-     * Useful when collecting errors in batch operations.
+     * Format a Google API failure as its envelope text without throwing.
+     * Used when collecting failures in batch operations, where each item carries its own evidence.
      */
-    protected formatGoogleApiError(error: unknown): string {
-        try {
-            this.handleGoogleApiError(error);
-        } catch (mcpError: unknown) {
-            if (mcpError instanceof McpError) return mcpError.message;
-            if (mcpError instanceof Error) return mcpError.message;
-            return 'Unknown error';
-        }
-        return 'Unknown error';
+    protected formatGoogleApiError(error: unknown, action: string = 'complete the request'): string {
+        return envelopeTextFor(error, action);
     }
 
-    protected handleGoogleApiError(error: unknown): never {
-        if (error instanceof GaxiosError) {
-            const status = error.response?.status;
-            const errorData = error.response?.data;
+    /**
+     * Turns any failure from the Google API into the uniform envelope
+     * (docs/MCP_FAILURE_ENVELOPE.md): `http_<status>`, the literal status line, and Google's
+     * response body verbatim. Nothing here interprets the body: an expired credential and a
+     * permission the account never had are both 403, and only the body separates them.
+     */
+    protected toEnvelopeError(error: unknown, action: string): EnvelopeError {
+        return envelopeErrorFor(error, action);
+    }
 
-            // Handle specific Google API errors with appropriate MCP error codes
-            if (errorData?.error === 'invalid_grant') {
-                throw new McpError(
-                    ErrorCode.InvalidRequest,
-                    'Authentication token is invalid or expired. Please re-run the authentication process (e.g., `npm run auth`).'
-                );
-            }
-
-            if (status === 400) {
-                // Extract detailed error information for Bad Request
-                const errorMessage = errorData?.error?.message;
-                const errorDetails = errorData?.error?.errors?.map((e: any) =>
-                    `${e.message || e.reason}${e.location ? ` (${e.location})` : ''}`
-                ).join('; ');
-
-                // Also include raw error data for debugging if details are missing
-                let fullMessage: string;
-                if (errorDetails) {
-                    fullMessage = `Bad Request: ${errorMessage || 'Invalid request parameters'}. Details: ${errorDetails}`;
-                } else if (errorMessage) {
-                    fullMessage = `Bad Request: ${errorMessage}`;
-                } else {
-                    // Include stringified error data for debugging
-                    const errorStr = JSON.stringify(errorData, null, 2);
-                    fullMessage = `Bad Request: Invalid request parameters. Raw error: ${errorStr}`;
-                }
-
-                throw new McpError(
-                    ErrorCode.InvalidRequest,
-                    fullMessage
-                );
-            }
-
-            if (status === 403) {
-                throw new McpError(
-                    ErrorCode.InvalidRequest,
-                    `Access denied: ${errorData?.error?.message || 'Insufficient permissions'}`
-                );
-            }
-
-            if (status === 404) {
-                throw new McpError(
-                    ErrorCode.InvalidRequest,
-                    `Resource not found: ${errorData?.error?.message || 'The requested calendar or event does not exist'}`
-                );
-            }
-
-            if (status === 429) {
-                const errorMessage = errorData?.error?.message || '';
-
-                // Provide specific guidance for quota-related rate limits
-                if (errorMessage.includes('User Rate Limit Exceeded')) {
-                    throw new McpError(
-                        ErrorCode.InvalidRequest,
-                        `Rate limit exceeded. This may be due to missing quota project configuration.
-
-Ensure your OAuth credentials include project_id information:
-1. Check that your gcp-oauth.keys.json file contains project_id
-2. Re-download credentials from Google Cloud Console if needed
-3. The file should have format: {"installed": {"project_id": "your-project-id", ...}}
-
-Original error: ${errorMessage}`
-                    );
-                }
-
-                throw new McpError(
-                    ErrorCode.InternalError,
-                    `Rate limit exceeded. Please try again later. ${errorMessage}`
-                );
-            }
-
-            if (status && status >= 500) {
-                throw new McpError(
-                    ErrorCode.InternalError,
-                    `Google API server error: ${errorData?.error?.message || error.message}`
-                );
-            }
-
-            // Generic Google API error with detailed information
-            const errorMessage = errorData?.error?.message || error.message;
-            const errorDetails = errorData?.error?.errors?.map((e: any) =>
-                `${e.message || e.reason}${e.location ? ` (${e.location})` : ''}`
-            ).join('; ');
-
-            const fullMessage = errorDetails
-                ? `Google API error: ${errorMessage}. Details: ${errorDetails}`
-                : `Google API error: ${errorMessage}`;
-
-            throw new McpError(
-                ErrorCode.InvalidRequest,
-                fullMessage
-            );
-        }
-
-        // Handle non-Google API errors
-        if (error instanceof Error) {
-            throw new McpError(
-                ErrorCode.InternalError,
-                `Internal error: ${error.message}`
-            );
-        }
-
-        throw new McpError(
-            ErrorCode.InternalError,
-            'An unknown error occurred'
-        );
+    protected handleGoogleApiError(error: unknown, action: string = 'complete the request'): never {
+        throw this.toEnvelopeError(error, action);
     }
 
     protected getCalendar(auth: OAuth2Client): calendar_v3.Calendar {
@@ -514,16 +423,26 @@ Original error: ${errorMessage}`
             const calendar = this.getCalendar(client);
             const response = await calendar.calendarList.get({ calendarId });
             if (!response.data) {
-                throw new Error(`Calendar ${calendarId} not found`);
+                throw localEnvelopeError(
+                    'unexpected_response',
+                    `Google returned no details for calendar "${calendarId}".`
+                );
             }
             return response.data;
         } catch (error) {
-            throw this.handleGoogleApiError(error);
+            throw this.handleGoogleApiError(error, `read the settings of calendar "${calendarId}"`);
         }
     }
 
     /**
-     * Gets the default timezone for a calendar, falling back to UTC if not available
+     * Gets the default timezone for a calendar.
+     *
+     * A 404 here is an expected absence, not a breakage: the calendar is simply not in this
+     * account's calendar list (a public or resource calendar addressed by id, for example), and
+     * UTC is the documented default. Every OTHER failure is propagated with its envelope. It used
+     * to swallow all of them into 'UTC', which turned an expired credential into a silently
+     * wrong time window (rule 6).
+     *
      * @param client OAuth2Client
      * @param calendarId Calendar ID
      * @returns Timezone string (IANA format)
@@ -533,8 +452,10 @@ Original error: ${errorMessage}`
             const calendarDetails = await this.getCalendarDetails(client, calendarId);
             return calendarDetails.timeZone || 'UTC';
         } catch (error) {
-            // If we can't get calendar details, fall back to UTC
-            return 'UTC';
+            if (isEnvelopeError(error) && error.status === 404) {
+                return 'UTC';
+            }
+            throw error;
         }
     }
 
@@ -584,7 +505,7 @@ Original error: ${errorMessage}`
      * @param client OAuth2Client
      * @param nameOrId Calendar name (summary/summaryOverride) or ID
      * @returns Calendar ID
-     * @throws McpError if calendar name cannot be resolved
+     * @throws EnvelopeError if calendar name cannot be resolved
      */
     protected async resolveCalendarId(client: OAuth2Client, nameOrId: string): Promise<string> {
         // If it looks like an ID (contains @ or is 'primary'), return as-is
@@ -636,16 +557,28 @@ Original error: ${errorMessage}`
                 })
                 .join(', ');
 
-            throw new McpError(
-                ErrorCode.InvalidRequest,
-                `Calendar "${nameOrId}" not found. Available calendars: ${availableCalendars || 'none'}. Use 'list-calendars' tool to see all available calendars.`
+            throw localEnvelopeError(
+                'calendar_not_found',
+                `This account has no calendar called "${nameOrId}".`,
+                `Calendars on this account: ${availableCalendars || 'none'}`
             );
         } catch (error) {
-            if (error instanceof McpError) {
+            if (isEnvelopeError(error)) {
                 throw error;
             }
-            throw this.handleGoogleApiError(error);
+            throw this.handleGoogleApiError(error, 'list the calendars on this account');
         }
+    }
+
+    /**
+     * If the calendar registry could not read one of the connected accounts, that HTTP failure is
+     * the true answer to "why did we not find this calendar", and it is thrown with its own
+     * envelope. Silence here would report a broken account as an empty calendar list.
+     */
+    protected throwCalendarAccessFailureIfAny(action: string): void {
+        const failure = this.calendarRegistry.getLastAccessFailure();
+        if (!failure) return;
+        throw this.toEnvelopeError(failure.error, action);
     }
 
     /**
@@ -670,11 +603,13 @@ Original error: ${errorMessage}`
         selectedAccounts: Map<string, OAuth2Client>
     ): Promise<never> {
         const allCalendars = await this.calendarRegistry.getUnifiedCalendars(selectedAccounts);
+        // An account that could not be read is a failure, not an absence.
+        this.throwCalendarAccessFailureIfAny('find the requested calendars');
         const calendarList = allCalendars.map(c => `"${c.displayName}" (${c.calendarId})`).join(', ');
-        throw new McpError(
-            ErrorCode.InvalidRequest,
-            `None of the requested calendars could be found: ${requestedCalendars.map(c => `"${c}"`).join(', ')}. ` +
-            `Available calendars: ${calendarList || 'none'}. Use 'list-calendars' to see all available calendars.`
+        throw localEnvelopeError(
+            'calendar_not_found',
+            `None of the requested calendars exist on the connected accounts: ${requestedCalendars.map(c => `"${c}"`).join(', ')}.`,
+            `Available calendars: ${calendarList || 'none'}`
         );
     }
 
@@ -692,16 +627,16 @@ Original error: ${errorMessage}`
      * @param client OAuth2Client
      * @param namesOrIds Array of calendar names (summary/summaryOverride) or IDs
      * @returns Array of resolved calendar IDs
-     * @throws McpError if any calendar name cannot be resolved
+     * @throws EnvelopeError if any calendar name cannot be resolved
      */
     protected async resolveCalendarIds(client: OAuth2Client, namesOrIds: string[]): Promise<string[]> {
         // Filter out empty/whitespace-only strings
         const validInputs = namesOrIds.filter(item => item && item.trim().length > 0);
 
         if (validInputs.length === 0) {
-            throw new McpError(
-                ErrorCode.InvalidRequest,
-                'At least one valid calendar identifier is required'
+            throw localEnvelopeError(
+                'bad_request',
+                'No calendar was named in the request.'
             );
         }
 
@@ -788,11 +723,10 @@ Original error: ${errorMessage}`
                 })
                 .join(', ');
 
-            const errorMessage = `Calendar(s) not found: ${errors.map(e => `"${e}"`).join(', ')}. Available calendars: ${availableCalendars || 'none'}. Use 'list-calendars' tool to see all available calendars.`;
-
-            throw new McpError(
-                ErrorCode.InvalidRequest,
-                errorMessage
+            throw localEnvelopeError(
+                'calendar_not_found',
+                `This account has no calendar called ${errors.map(e => `"${e}"`).join(', ')}.`,
+                `Calendars on this account: ${availableCalendars || 'none'}`
             );
         }
 

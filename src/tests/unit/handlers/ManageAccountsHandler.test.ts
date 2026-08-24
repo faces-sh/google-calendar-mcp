@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { ManageAccountsHandler, ServerContext } from '../../../handlers/core/ManageAccountsHandler.js';
 import { OAuth2Client } from 'google-auth-library';
-import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js';
+import { EnvelopeError } from '../../../utils/failure-envelope.js';
 import { AuthServer } from '../../../auth/server.js';
 import { TokenManager } from '../../../auth/tokenManager.js';
 import { google } from 'googleapis';
@@ -119,13 +119,16 @@ describe('ManageAccountsHandler', () => {
       expect(response.message).toContain("action 'add'");
     });
 
-    it('should handle API errors gracefully (return error status per account)', async () => {
+    it('reports an account that could not be read as an error, not as active', async () => {
+      // It used to report status 'active' whenever a refresh token happened to be on disk, even
+      // when Google had just refused the request (docs/MCP_FAILURE_ENVELOPE.md rule 6).
       mockCalendarList.mockRejectedValue(new Error('API Error'));
 
       const result = await handler.runTool({ action: 'list' }, mockContext);
 
       const response = JSON.parse(result.content[0].text as string);
-      expect(response.accounts[0].status).toBe('active'); // Falls back to checking refresh_token
+      expect(response.accounts[0].status).toBe('error');
+      expect(response.accounts[0].error).toContain('[internal_error]');
       expect(response.accounts[0].error).toContain('API Error');
     });
 
@@ -162,13 +165,13 @@ describe('ManageAccountsHandler', () => {
     it('should throw error for non-existent account_id', async () => {
       await expect(
         handler.runTool({ action: 'list', account_id: 'nonexistent' }, mockContext)
-      ).rejects.toThrow(McpError);
+      ).rejects.toThrow(EnvelopeError);
 
       try {
         await handler.runTool({ action: 'list', account_id: 'nonexistent' }, mockContext);
       } catch (error) {
-        expect((error as McpError).code).toBe(ErrorCode.InvalidRequest);
-        expect((error as McpError).message).toContain('not found');
+        expect((error as EnvelopeError).envelopeCode).toBe('account_not_found');
+        expect((error as EnvelopeError).message).toContain('There is no connected account');
       }
     });
   });
@@ -212,7 +215,7 @@ describe('ManageAccountsHandler', () => {
       // Note: uppercase is normalized to lowercase, so test with actually invalid chars
       await expect(
         handler.runTool({ action: 'add', account_id: 'invalid@email.com' }, mockContext)
-      ).rejects.toThrow(McpError);
+      ).rejects.toThrow(EnvelopeError);
     });
 
     it('should reject invalid account_id (path traversal, special chars)', async () => {
@@ -228,13 +231,13 @@ describe('ManageAccountsHandler', () => {
     it('should throw error when no account_id provided', async () => {
       await expect(
         handler.runTool({ action: 'add' }, mockContext)
-      ).rejects.toThrow(McpError);
+      ).rejects.toThrow(EnvelopeError);
 
       try {
         await handler.runTool({ action: 'add' }, mockContext);
       } catch (error) {
-        expect((error as McpError).code).toBe(ErrorCode.InvalidRequest);
-        expect((error as McpError).message).toContain('account_id is required');
+        expect((error as EnvelopeError).envelopeCode).toBe('bad_request');
+        expect((error as EnvelopeError).message).toContain('account_id is required');
       }
     });
 
@@ -254,13 +257,13 @@ describe('ManageAccountsHandler', () => {
 
       await expect(
         handler.runTool({ action: 'add', account_id: 'newaccount' }, mockContext)
-      ).rejects.toThrow(McpError);
+      ).rejects.toThrow(EnvelopeError);
 
       try {
         await handler.runTool({ action: 'add', account_id: 'newaccount' }, mockContext);
       } catch (error) {
-        expect((error as McpError).code).toBe(ErrorCode.InternalError);
-        expect((error as McpError).message).toContain('Ports');
+        expect((error as EnvelopeError).envelopeCode).toBe('auth_server_failed');
+        expect((error as EnvelopeError).message).toContain('Ports');
       }
     });
 
@@ -306,26 +309,26 @@ describe('ManageAccountsHandler', () => {
     it('should throw error if account_id not provided', async () => {
       await expect(
         handler.runTool({ action: 'remove' }, mockContext)
-      ).rejects.toThrow(McpError);
+      ).rejects.toThrow(EnvelopeError);
 
       try {
         await handler.runTool({ action: 'remove' }, mockContext);
       } catch (error) {
-        expect((error as McpError).code).toBe(ErrorCode.InvalidRequest);
-        expect((error as McpError).message).toContain('required');
+        expect((error as EnvelopeError).envelopeCode).toBe('bad_request');
+        expect((error as EnvelopeError).message).toContain('required');
       }
     });
 
     it('should throw error if account not found', async () => {
       await expect(
         handler.runTool({ action: 'remove', account_id: 'nonexistent' }, mockContext)
-      ).rejects.toThrow(McpError);
+      ).rejects.toThrow(EnvelopeError);
 
       try {
         await handler.runTool({ action: 'remove', account_id: 'nonexistent' }, mockContext);
       } catch (error) {
-        expect((error as McpError).code).toBe(ErrorCode.InvalidRequest);
-        expect((error as McpError).message).toContain('not found');
+        expect((error as EnvelopeError).envelopeCode).toBe('account_not_found');
+        expect((error as EnvelopeError).message).toContain('There is no connected account');
       }
     });
 
@@ -337,13 +340,13 @@ describe('ManageAccountsHandler', () => {
 
       await expect(
         handler.runTool({ action: 'remove', account_id: 'test' }, mockContext)
-      ).rejects.toThrow(McpError);
+      ).rejects.toThrow(EnvelopeError);
 
       try {
         await handler.runTool({ action: 'remove', account_id: 'test' }, mockContext);
       } catch (error) {
-        expect((error as McpError).code).toBe(ErrorCode.InvalidRequest);
-        expect((error as McpError).message).toContain('last authenticated account');
+        expect((error as EnvelopeError).envelopeCode).toBe('last_account');
+        expect((error as EnvelopeError).message).toContain('only connected account');
       }
 
       // Should NOT call removeAccount
@@ -364,7 +367,7 @@ describe('ManageAccountsHandler', () => {
     it('should validate account_id format', async () => {
       await expect(
         handler.runTool({ action: 'remove', account_id: 'INVALID' }, mockContext)
-      ).rejects.toThrow(McpError);
+      ).rejects.toThrow(EnvelopeError);
     });
 
     it('should handle tokenManager.removeAccount failure', async () => {
@@ -374,13 +377,13 @@ describe('ManageAccountsHandler', () => {
 
       await expect(
         handler.runTool({ action: 'remove', account_id: 'work' }, mockContext)
-      ).rejects.toThrow(McpError);
+      ).rejects.toThrow(EnvelopeError);
 
       try {
         await handler.runTool({ action: 'remove', account_id: 'work' }, mockContext);
       } catch (error) {
-        expect((error as McpError).code).toBe(ErrorCode.InternalError);
-        expect((error as McpError).message).toContain('File system error');
+        expect((error as EnvelopeError).envelopeCode).toBe('internal_error');
+        expect((error as EnvelopeError).message).toContain('File system error');
       }
     });
   });
@@ -390,13 +393,13 @@ describe('ManageAccountsHandler', () => {
     it('should throw error for unknown action', async () => {
       await expect(
         handler.runTool({ action: 'invalid' as any }, mockContext)
-      ).rejects.toThrow(McpError);
+      ).rejects.toThrow(EnvelopeError);
 
       try {
         await handler.runTool({ action: 'unknown' as any }, mockContext);
       } catch (error) {
-        expect((error as McpError).code).toBe(ErrorCode.InvalidRequest);
-        expect((error as McpError).message).toContain('Invalid action');
+        expect((error as EnvelopeError).envelopeCode).toBe('bad_request');
+        expect((error as EnvelopeError).message).toContain('Invalid action');
       }
     });
   });

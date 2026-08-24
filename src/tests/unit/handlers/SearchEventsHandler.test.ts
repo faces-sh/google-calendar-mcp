@@ -555,7 +555,8 @@ describe('SearchEventsHandler', () => {
       expect(parsed.totalCount).toBe(1);
       expect(parsed.warnings).toBeDefined();
       expect(parsed.warnings.length).toBeGreaterThan(0);
-      expect(parsed.warnings[0]).toContain('Failed to search calendar');
+      expect(parsed.warnings[0]).toContain('could not be searched');
+      expect(parsed.warnings[0]).toContain('[internal_error]');
     });
 
     it('should throw error when no calendars can be resolved', async () => {
@@ -572,7 +573,7 @@ describe('SearchEventsHandler', () => {
         account: ['work', 'personal'],
         calendarId: ['missing-calendar'],
         query: 'Team'
-      }, multiAccounts)).rejects.toThrow('None of the requested calendars could be found');
+      }, multiAccounts)).rejects.toThrow('[calendar_not_found] None of the requested calendars exist on the connected accounts');
     });
   });
 });

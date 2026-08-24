@@ -1,4 +1,4 @@
-import { CallToolResult, McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
+import { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { OAuth2Client } from "google-auth-library";
 import { UpdateEventInput } from "../../tools/registry.js";
 import { BaseToolHandler } from "./BaseToolHandler.js";
@@ -15,6 +15,7 @@ import {
     UpdateEventResponse,
     convertGoogleEventToStructured 
 } from "../../types/structured-responses.js";
+import { isEnvelopeError, localEnvelopeError } from "../../utils/failure-envelope.js";
 
 export class UpdateEventHandler extends BaseToolHandler {
     private conflictDetectionService: ConflictDetectionService;
@@ -45,7 +46,10 @@ export class UpdateEventHandler extends BaseToolHandler {
             existingEvent = existingEventResponse.data;
 
             if (!existingEvent) {
-                throw new Error('Event not found');
+                throw localEnvelopeError(
+                    'unexpected_response',
+                    `Google returned no event for id "${validArgs.eventId}".`
+                );
             }
         }
 
@@ -144,10 +148,10 @@ export class UpdateEventHandler extends BaseToolHandler {
                     );
             }
         } catch (error) {
-            if (error instanceof RecurringEventError) {
+            if (isEnvelopeError(error)) {
                 throw error;
             }
-            throw this.handleGoogleApiError(error);
+            throw this.handleGoogleApiError(error, `update event "${args.eventId}"`);
         }
     }
 
@@ -178,7 +182,9 @@ export class UpdateEventHandler extends BaseToolHandler {
             ...(supportsAttachments && { supportsAttachments })
         });
 
-        if (!response.data) throw new Error('Failed to update event instance');
+        if (!response.data) {
+            throw localEnvelopeError('unexpected_response', 'Google accepted the change but returned nothing.');
+        }
         return response.data;
     }
 
@@ -201,7 +207,9 @@ export class UpdateEventHandler extends BaseToolHandler {
             ...(supportsAttachments && { supportsAttachments })
         });
 
-        if (!response.data) throw new Error('Failed to update event');
+        if (!response.data) {
+            throw localEnvelopeError('unexpected_response', 'Google accepted the change but returned nothing.');
+        }
         return response.data;
     }
 
@@ -228,7 +236,10 @@ export class UpdateEventHandler extends BaseToolHandler {
         const originalEvent = originalResponse.data;
 
         if (!originalEvent.recurrence) {
-            throw new Error('Event does not have recurrence rules');
+            throw localEnvelopeError(
+                'not_recurring',
+                `Event "${args.eventId}" is not a recurring event, so following instances cannot be changed.`
+            );
         }
 
         // 2. Calculate UNTIL date and update original event
@@ -274,7 +285,9 @@ export class UpdateEventHandler extends BaseToolHandler {
             ...(supportsAttachments && { supportsAttachments })
         });
 
-        if (!response.data) throw new Error('Failed to create new recurring event');
+        if (!response.data) {
+            throw localEnvelopeError('unexpected_response', 'Google accepted the new recurring event but returned nothing.');
+        }
         return response.data;
     }
 

@@ -1,5 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
+import { CallToolResult, McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
+import { resolveArgs, wrapResult } from "./circuitBuffer.js";
+import { EnvelopeError, ensureEnvelope, envelopeErrorFor, envelopeTextFor, isEnvelopeError, localEnvelopeError, toEnvelopeResult } from "./utils/failure-envelope.js";
 
 import { OAuth2Client } from "google-auth-library";
 import { readFileSync } from "fs";
@@ -37,6 +39,11 @@ export class GoogleCalendarMcpServer {
   private authServer!: AuthServer;
   private config: ServerConfig;
   private accounts!: Map<string, OAuth2Client>;
+  // Set when the credentials file could not be read. The server still starts and still advertises
+  // every tool; each call answers with this envelope instead. A server that refuses to start is a
+  // DEAD extension: it resolves to nothing, the turn opens with an empty toolbox, and the step
+  // fails silently. A server that starts and says [no_credentials] can be acted on.
+  private credentialsFailure?: EnvelopeError;
 
   constructor(config: ServerConfig) {
     this.config = config;
@@ -47,21 +54,35 @@ export class GoogleCalendarMcpServer {
   }
 
   async initialize(): Promise<void> {
-    // 1. Initialize Authentication (but don't block on it)
-    this.oauth2Client = await initializeOAuth2Client();
-    this.tokenManager = new TokenManager(this.oauth2Client);
-    this.authServer = new AuthServer(this.oauth2Client);
+    // 1. Initialize Authentication (but don't block on it). A missing or unreadable credentials
+    //    file is remembered, not fatal: see credentialsFailure.
+    try {
+      this.oauth2Client = await initializeOAuth2Client();
+      this.tokenManager = new TokenManager(this.oauth2Client);
+      this.authServer = new AuthServer(this.oauth2Client);
 
-    // 2. Load all authenticated accounts
-    this.accounts = await this.tokenManager.loadAllAccounts();
+      // 2. Load all authenticated accounts
+      this.accounts = await this.tokenManager.loadAllAccounts();
 
-    // 3. Handle startup authentication based on transport type
-    await this.handleStartupAuthentication();
+      // 3. Handle startup authentication based on transport type
+      await this.handleStartupAuthentication();
+    } catch (error) {
+      this.credentialsFailure = envelopeErrorFor(error, 'read the Google credentials');
+      process.stderr.write(`${this.credentialsFailure.envelope}\n`);
+      process.stderr.write('The server is starting anyway; every tool will report this failure until it is resolved.\n');
+      // Placeholder wiring so the rest of the server is fully constructed. Nothing reaches it:
+      // every tool path checks credentialsFailure first.
+      this.oauth2Client = new OAuth2Client();
+      this.tokenManager = new TokenManager(this.oauth2Client);
+      this.authServer = new AuthServer(this.oauth2Client);
+      this.accounts = new Map();
+    }
 
     // 4. Set up Modern Tool Definitions
     this.registerTools();
     this.registerPrompts();
     this.registerResources();
+    this.guardToolResults();
 
     // 5. Set up Graceful Shutdown
     this.setupGracefulShutdown();
@@ -158,9 +179,43 @@ export class GoogleCalendarMcpServer {
         }
       },
       async (args) => {
-        return manageAccountsHandler.runTool(args, serverContext);
+        // Same envelope funnel as every other tool (docs/MCP_FAILURE_ENVELOPE.md).
+        try {
+          if (this.credentialsFailure) {
+            throw this.credentialsFailure;
+          }
+          return await manageAccountsHandler.runTool(args, serverContext);
+        } catch (error) {
+          return toEnvelopeResult(error, 'manage the connected accounts');
+        }
       }
     );
+  }
+
+  /**
+   * Wraps the SDK's tools/call handler so that EVERY failing tool result leaves as the envelope.
+   *
+   * The funnel in ToolRegistry catches everything our own code can throw, but the SDK validates
+   * arguments against the registered input schema before that funnel is reached, and reports a
+   * rejection as `isError: true` with the text "MCP error -32602: ...". Rule 2 says nothing comes
+   * before the code, so that result is re-shaped here, at the outermost point a result exists.
+   */
+  private guardToolResults(): void {
+    const handlers: Map<string, (request: any, extra: any) => Promise<unknown>> | undefined =
+      (this.server.server as any)?._requestHandlers;
+    const inner = handlers?.get('tools/call');
+
+    if (!handlers || !inner) {
+      // Said out loud rather than swallowed: without this wrapper, the SDK's own validation
+      // failures reach the caller without an envelope.
+      process.stderr.write('WARNING: could not wrap the tools/call handler; argument-validation failures will not carry the failure envelope.\n');
+      return;
+    }
+
+    handlers.set('tools/call', async (request: any, extra: any) => {
+      const result = await inner(request, extra);
+      return ensureEnvelope(result, `run ${request?.params?.name ?? 'the tool'}`);
+    });
   }
 
   private registerPrompts(): void {
@@ -323,12 +378,10 @@ export class GoogleCalendarMcpServer {
             ]
           };
         } catch (error) {
-          if (error instanceof McpError) {
-            throw error;
-          }
+          // A resource read has no isError flag, so the envelope travels as the error message.
           throw new McpError(
             ErrorCode.InternalError,
-            `Failed to load calendar accounts: ${error instanceof Error ? error.message : String(error)}`
+            envelopeTextFor(error, 'load the connected accounts')
           );
         }
       }
@@ -336,6 +389,11 @@ export class GoogleCalendarMcpServer {
   }
 
   private async ensureAuthenticated(): Promise<void> {
+    // No credentials file: the same failure every time, with the path it looked for.
+    if (this.credentialsFailure) {
+      throw this.credentialsFailure;
+    }
+
     const availableAccounts = await this.tokenManager.loadAllAccounts();
     if (availableAccounts.size > 0) {
       this.accounts = availableAccounts;
@@ -353,38 +411,41 @@ export class GoogleCalendarMcpServer {
 
     // For stdio mode, authentication should have been handled at startup
     if (this.config.transport.type === 'stdio') {
-      throw new McpError(
-        ErrorCode.InvalidRequest,
-        "Authentication tokens are no longer valid. Please restart the server to re-authenticate."
+      throw localEnvelopeError(
+        'no_credentials',
+        'The stored Google credentials are no longer valid.'
       );
     }
 
     // For HTTP mode, try to start auth server if not already running
     try {
       const authSuccess = await this.authServer.start(false); // openBrowser = false for HTTP mode
-      
+
       if (!authSuccess) {
-        throw new McpError(
-          ErrorCode.InvalidRequest,
-          "Authentication required. Please run 'npm run auth' to authenticate, or visit the auth URL shown in the logs for HTTP mode."
+        throw localEnvelopeError(
+          'no_credentials',
+          'No Google account is connected and the authentication server could not be started.'
         );
       }
     } catch (error) {
-      if (error instanceof McpError) {
+      if (isEnvelopeError(error)) {
         throw error;
       }
-      if (error instanceof Error) {
-        throw new McpError(ErrorCode.InvalidRequest, error.message);
-      }
-      throw new McpError(ErrorCode.InvalidRequest, "Authentication required. Please run 'npm run auth' to authenticate.");
+      throw localEnvelopeError(
+        'no_credentials',
+        'No Google account is connected and authentication could not be started.',
+        error instanceof Error ? error.message : String(error)
+      );
     }
   }
 
-  private async executeWithHandler(handler: any, args: any): Promise<{ content: Array<{ type: "text"; text: string }> }> {
+  private async executeWithHandler(handler: any, args: any): Promise<CallToolResult> {
     await this.ensureAuthenticated();
 
-    const result = await handler.runTool(args, this.accounts);
-    return result;
+    // Circuit (docs/reqs/007): expand @@hN@@ handles in the args before the tool runs, and park a large result
+    // behind a handle on the way out. No-op without the circuit env, so the server still runs standalone.
+    const result = await handler.runTool(await resolveArgs(args), this.accounts);
+    return await wrapResult(result);
   }
 
   async start(): Promise<void> {

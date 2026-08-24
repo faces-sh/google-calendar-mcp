@@ -1,4 +1,4 @@
-import { CallToolResult, McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
+import { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { OAuth2Client } from "google-auth-library";
 import { google } from "googleapis";
 import { AuthServer } from "../../auth/server.js";
@@ -10,6 +10,7 @@ import {
   AccountInfo,
   RemoveAccountResponse
 } from "../../types/structured-responses.js";
+import { envelopeTextFor, httpEnvelopeError, isEnvelopeError, localEnvelopeError } from "../../utils/failure-envelope.js";
 
 export type ManageAccountsAction = 'list' | 'add' | 'remove';
 
@@ -44,8 +45,8 @@ export class ManageAccountsHandler {
       case 'remove':
         return this.removeAccount(args.account_id, context);
       default:
-        throw new McpError(
-          ErrorCode.InvalidRequest,
+        throw localEnvelopeError(
+          'bad_request',
           `Invalid action: ${args.action}. Must be 'list', 'add', or 'remove'.`
         );
     }
@@ -63,9 +64,10 @@ export class ManageAccountsHandler {
 
       if (!client) {
         const availableAccounts = Array.from(accounts.keys()).join(', ') || 'none';
-        throw new McpError(
-          ErrorCode.InvalidRequest,
-          `Account "${normalizedId}" not found. Available accounts: ${availableAccounts}`
+        throw localEnvelopeError(
+          'account_not_found',
+          `There is no connected account called "${normalizedId}".`,
+          `Connected accounts: ${availableAccounts}`
         );
       }
 
@@ -109,11 +111,12 @@ export class ManageAccountsHandler {
         const info = await this.getAccountInfo(accId, client);
         accountInfos.push(info);
       } catch (error) {
-        errors.push(`${accId}: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        const envelope = envelopeTextFor(error, `read account "${accId}"`);
+        errors.push(`${accId}: ${envelope}`);
         accountInfos.push({
           account_id: accId,
           status: 'error',
-          error: error instanceof Error ? error.message : 'Failed to fetch account details'
+          error: envelope
         });
       }
     }
@@ -161,21 +164,33 @@ export class ManageAccountsHandler {
         token_expiry: expiryDate ? new Date(expiryDate).toISOString() : undefined
       };
     } catch (error) {
-      const credentials = client.credentials;
-      return {
-        account_id: accountId,
-        status: credentials.refresh_token ? 'active' : 'invalid',
-        error: error instanceof Error ? error.message : 'Failed to verify account'
-      };
+      // This used to report status 'active' whenever a refresh token happened to be on disk, even
+      // when Google had just refused the request. The failure is the answer; the caller decides
+      // what it means (docs/MCP_FAILURE_ENVELOPE.md rules 5 and 6).
+      const response = (error as any)?.response;
+      if (typeof response?.status === 'number') {
+        throw httpEnvelopeError({
+          action: `read account "${accountId}"`,
+          status: response.status,
+          statusText: response.statusText,
+          body: response.data
+        });
+      }
+      if (isEnvelopeError(error)) throw error;
+      throw localEnvelopeError(
+        'internal_error',
+        `Account "${accountId}" could not be read.`,
+        error instanceof Error ? error.message : String(error)
+      );
     }
   }
 
   // ============ ADD ACTION ============
   private async addAccount(accountId: string | undefined, context: ServerContext): Promise<CallToolResult> {
     if (!accountId) {
-      throw new McpError(
-        ErrorCode.InvalidRequest,
-        "account_id is required for 'add' action. Provide a nickname like 'work' or 'personal' to identify this account."
+      throw localEnvelopeError(
+        'bad_request',
+        "account_id is required for the 'add' action."
       );
     }
 
@@ -185,9 +200,10 @@ export class ManageAccountsHandler {
     try {
       validateAccountId(normalizedId);
     } catch (error) {
-      throw new McpError(
-        ErrorCode.InvalidRequest,
-        error instanceof Error ? error.message : 'Invalid account nickname format'
+      throw localEnvelopeError(
+        'bad_request',
+        'The account nickname is not a valid account nickname.',
+        error instanceof Error ? error.message : undefined
       );
     }
 
@@ -216,9 +232,10 @@ export class ManageAccountsHandler {
       const started = await context.authServer.startForMcpTool(normalizedId);
 
       if (!started.success) {
-        throw new McpError(
-          ErrorCode.InternalError,
-          started.error || 'Failed to start authentication server'
+        throw localEnvelopeError(
+          'auth_server_failed',
+          'The authentication server could not be started.',
+          started.error
         );
       }
 
@@ -239,12 +256,13 @@ export class ManageAccountsHandler {
         }]
       };
     } catch (error) {
-      if (error instanceof McpError) {
+      if (isEnvelopeError(error)) {
         throw error;
       }
-      throw new McpError(
-        ErrorCode.InternalError,
-        `Failed to start authentication: ${error instanceof Error ? error.message : 'Unknown error'}`
+      throw localEnvelopeError(
+        'auth_server_failed',
+        'Authentication could not be started.',
+        error instanceof Error ? error.message : String(error)
       );
     }
   }
@@ -252,9 +270,9 @@ export class ManageAccountsHandler {
   // ============ REMOVE ACTION ============
   private async removeAccount(accountId: string | undefined, context: ServerContext): Promise<CallToolResult> {
     if (!accountId) {
-      throw new McpError(
-        ErrorCode.InvalidRequest,
-        "account_id is required for 'remove' action. Specify the nickname of the account to remove."
+      throw localEnvelopeError(
+        'bad_request',
+        "account_id is required for the 'remove' action."
       );
     }
 
@@ -264,9 +282,10 @@ export class ManageAccountsHandler {
     try {
       validateAccountId(normalizedId);
     } catch (error) {
-      throw new McpError(
-        ErrorCode.InvalidRequest,
-        error instanceof Error ? error.message : 'Invalid account nickname format'
+      throw localEnvelopeError(
+        'bad_request',
+        'The account nickname is not a valid account nickname.',
+        error instanceof Error ? error.message : undefined
       );
     }
 
@@ -276,17 +295,18 @@ export class ManageAccountsHandler {
     // Check if account exists
     if (!accounts.has(normalizedId)) {
       const availableAccounts = Array.from(accounts.keys()).join(', ') || 'none';
-      throw new McpError(
-        ErrorCode.InvalidRequest,
-        `Account "${normalizedId}" not found. Available accounts: ${availableAccounts}`
+      throw localEnvelopeError(
+        'account_not_found',
+        `There is no connected account called "${normalizedId}".`,
+        `Connected accounts: ${availableAccounts}`
       );
     }
 
     // Prevent removing the last account
     if (accounts.size === 1) {
-      throw new McpError(
-        ErrorCode.InvalidRequest,
-        `Cannot remove the last authenticated account. Use action 'add' to connect another account first, then remove this one.`
+      throw localEnvelopeError(
+        'last_account',
+        `Account "${normalizedId}" was not removed because it is the only connected account.`
       );
     }
 
@@ -312,9 +332,13 @@ export class ManageAccountsHandler {
         }]
       };
     } catch (error) {
-      throw new McpError(
-        ErrorCode.InternalError,
-        `Failed to remove account: ${error instanceof Error ? error.message : 'Unknown error'}`
+      if (isEnvelopeError(error)) {
+        throw error;
+      }
+      throw localEnvelopeError(
+        'internal_error',
+        `Account "${normalizedId}" could not be removed.`,
+        error instanceof Error ? error.message : String(error)
       );
     }
   }

@@ -225,10 +225,10 @@ describe('RecurringEventHelpers', () => {
 
     it('should throw error for empty recurrence', () => {
       expect(() => helpers.updateRecurrenceWithUntil([], '20240630T170000Z'))
-        .toThrow('No recurrence rule found');
+        .toThrow('[not_recurring] The event has no recurrence rule to change.');
       
       expect(() => helpers.updateRecurrenceWithUntil(undefined as any, '20240630T170000Z'))
-        .toThrow('No recurrence rule found');
+        .toThrow('[not_recurring] The event has no recurrence rule to change.');
     });
 
     it('should handle recurrence with EXDATE rules', () => {
@@ -273,7 +273,7 @@ describe('RecurringEventHelpers', () => {
       const untilDate = '20240630T170000Z';
 
       expect(() => helpers.updateRecurrenceWithUntil(recurrence, untilDate))
-        .toThrow('No RRULE found in recurrence rules');
+        .toThrow('[not_recurring] The event has no RRULE in its recurrence rules.');
     });
 
     it('should handle complex recurrence with multiple EXDATE rules as reported in user issue', () => {
