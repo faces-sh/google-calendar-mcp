@@ -285,3 +285,52 @@ export function toEnvelopeResult(error: unknown, action: string): CallToolResult
     content: [{ type: "text", text: envelopeTextFor(error, action) }]
   };
 }
+
+/** A leading [snake_case_code], which is what Maestro recognises. */
+const LEADING_CODE = /^\[[a-z][a-z0-9_]*\]\s+\S/;
+
+/**
+ * The JSON-RPC error codes the MCP SDK uses, mapped to our codes. This is not a guess about what
+ * the failure MEANT: it is the classification the SDK itself already made, read back off its own
+ * message rather than re-derived from the prose.
+ */
+const RPC_CODES: Record<string, { code: string; clause?: string }> = {
+  "-32602": { code: "bad_request", clause: "the arguments were not valid" },
+  "-32601": { code: "unknown_tool", clause: "there is no such tool" },
+  "-32600": { code: "bad_request", clause: "the request was not valid" },
+  "-32603": { code: "internal_error" },
+  "-32700": { code: "bad_request", clause: "the request could not be parsed" }
+};
+
+const RPC_PREFIX = /^MCP error (-?\d+):\s*/;
+
+/**
+ * The last line of defence, applied to every tool result on its way out.
+ *
+ * The MCP SDK validates arguments against the registered input schema BEFORE our handler is ever
+ * called, and turns a rejection into `isError: true` whose text begins "MCP error -32602: ...".
+ * That is a failure with something in front of the code, which is precisely what rule 2 forbids
+ * and precisely what Maestro cannot read. This re-shapes it without touching a result that is
+ * already an envelope.
+ */
+export function ensureEnvelope(result: unknown, action: string): unknown {
+  const r = result as any;
+  if (!r || r.isError !== true || !Array.isArray(r.content)) return result;
+
+  const first = r.content[0];
+  if (!first || first.type !== "text" || typeof first.text !== "string") return result;
+
+  const text: string = first.text.trim();
+  if (LEADING_CODE.test(text)) return result;
+
+  const match = RPC_PREFIX.exec(text);
+  const mapped = match ? RPC_CODES[match[1]] : undefined;
+  const code = mapped?.code ?? "internal_error";
+  const summary = mapped?.clause
+    ? `Could not ${action}: ${mapped.clause}.`
+    : `Could not ${action}.`;
+  // The original text becomes the evidence, verbatim: it holds the schema complaint.
+  const body = match ? text.slice(match[0].length) : text;
+
+  return { ...r, content: [{ ...first, text: formatEnvelope({ code, summary, body }) }, ...r.content.slice(1)] };
+}

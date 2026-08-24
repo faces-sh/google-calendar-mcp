@@ -10,6 +10,206 @@ var __export = (target, all) => {
     __defProp(target, name, { get: all[name], enumerable: true });
 };
 
+// src/utils/failure-envelope.ts
+function redactSecrets(input) {
+  if (!input) return input;
+  return input.replace(JSON_SECRET, (_m, prefix, openQuote, closeQuote) => `${prefix}${openQuote}${REDACTED}${closeQuote}`).replace(HEADER_SECRET, (_m, prefix) => `${prefix}${REDACTED}`).replace(QUERY_SECRET, (_m, prefix) => `${prefix}${REDACTED}`).replace(BEARER, (_m, scheme) => `${scheme} ${REDACTED}`);
+}
+function capBody(body) {
+  if (body.length <= MAX_BODY_CHARS) return body;
+  return body.slice(0, MAX_BODY_CHARS) + TRUNCATION_MARKER;
+}
+function bodyToText(body) {
+  if (body === void 0 || body === null) return void 0;
+  if (typeof body === "string") return body;
+  try {
+    return JSON.stringify(body);
+  } catch {
+    return String(body);
+  }
+}
+function reasonPhrase(status, literal) {
+  if (literal && literal.trim().length > 0) return literal.trim();
+  return REASON_PHRASES[status] ?? "";
+}
+function statusLineFor(status, literal) {
+  const phrase = reasonPhrase(status, literal);
+  return phrase ? `HTTP ${status} ${phrase}` : `HTTP ${status}`;
+}
+function summaryForStatus(action, status) {
+  const clause = STATUS_CLAUSES[status] ?? (status >= 500 ? "Google reported a server error" : void 0);
+  return clause ? `Could not ${action}: ${clause}.` : `Could not ${action}.`;
+}
+function formatEnvelope(parts) {
+  const lines = [`[${parts.code}] ${parts.summary}`];
+  if (parts.statusLine) lines.push(parts.statusLine);
+  const body = parts.body === void 0 ? void 0 : capBody(redactSecrets(parts.body));
+  if (body !== void 0 && body.length > 0) lines.push(body);
+  return lines.join("\n");
+}
+function httpEnvelopeError(options) {
+  return new EnvelopeError({
+    code: `http_${options.status}`,
+    summary: options.summary ?? summaryForStatus(options.action, options.status),
+    statusLine: statusLineFor(options.status, options.statusText),
+    body: bodyToText(options.body),
+    status: options.status
+  });
+}
+function localEnvelopeError(code, summary, body) {
+  return new EnvelopeError({ code, summary, body });
+}
+function isEnvelopeError(error) {
+  return error instanceof EnvelopeError;
+}
+function envelopeErrorFor(error, action) {
+  if (isEnvelopeError(error)) return error;
+  const response = error?.response;
+  const status = response?.status ?? (typeof error?.code === "number" ? error.code : void 0);
+  if (typeof status === "number") {
+    return httpEnvelopeError({
+      action,
+      status,
+      statusText: response?.statusText,
+      body: response?.data ?? (error instanceof Error ? error.message : void 0)
+    });
+  }
+  const transportCode = String(error?.code ?? "").toUpperCase();
+  if (transportCode) {
+    const code = transportCode === "ETIMEDOUT" || transportCode === "ECONNABORTED" || transportCode === "ERR_CANCELED" ? "timeout" : "network_error";
+    return localEnvelopeError(
+      code,
+      `Could not ${action}: the request did not complete.`,
+      error instanceof Error ? error.message : String(error)
+    );
+  }
+  if (error instanceof Error) {
+    const code = error.name === "ZodError" ? "bad_request" : "internal_error";
+    return localEnvelopeError(code, `Could not ${action}.`, error.message);
+  }
+  return localEnvelopeError(
+    "internal_error",
+    `Could not ${action}.`,
+    typeof error === "string" ? error : bodyToText(error)
+  );
+}
+function envelopeTextFor(error, action) {
+  return envelopeErrorFor(error, action).envelope;
+}
+function toEnvelopeResult(error, action) {
+  return {
+    isError: true,
+    content: [{ type: "text", text: envelopeTextFor(error, action) }]
+  };
+}
+function ensureEnvelope(result, action) {
+  const r = result;
+  if (!r || r.isError !== true || !Array.isArray(r.content)) return result;
+  const first = r.content[0];
+  if (!first || first.type !== "text" || typeof first.text !== "string") return result;
+  const text = first.text.trim();
+  if (LEADING_CODE.test(text)) return result;
+  const match = RPC_PREFIX.exec(text);
+  const mapped = match ? RPC_CODES[match[1]] : void 0;
+  const code = mapped?.code ?? "internal_error";
+  const summary = mapped?.clause ? `Could not ${action}: ${mapped.clause}.` : `Could not ${action}.`;
+  const body = match ? text.slice(match[0].length) : text;
+  return { ...r, content: [{ ...first, text: formatEnvelope({ code, summary, body }) }, ...r.content.slice(1)] };
+}
+var MAX_BODY_CHARS, TRUNCATION_MARKER, REASON_PHRASES, STATUS_CLAUSES, SECRET_KEYS, REDACTED, KEY_ALTERNATION, JSON_SECRET, HEADER_SECRET, QUERY_SECRET, BEARER, EnvelopeError, LEADING_CODE, RPC_CODES, RPC_PREFIX;
+var init_failure_envelope = __esm({
+  "src/utils/failure-envelope.ts"() {
+    "use strict";
+    MAX_BODY_CHARS = 4e3;
+    TRUNCATION_MARKER = " ...[truncated]";
+    REASON_PHRASES = {
+      400: "Bad Request",
+      401: "Unauthorized",
+      402: "Payment Required",
+      403: "Forbidden",
+      404: "Not Found",
+      405: "Method Not Allowed",
+      406: "Not Acceptable",
+      408: "Request Timeout",
+      409: "Conflict",
+      410: "Gone",
+      412: "Precondition Failed",
+      413: "Payload Too Large",
+      415: "Unsupported Media Type",
+      422: "Unprocessable Entity",
+      423: "Locked",
+      428: "Precondition Required",
+      429: "Too Many Requests",
+      500: "Internal Server Error",
+      501: "Not Implemented",
+      502: "Bad Gateway",
+      503: "Service Unavailable",
+      504: "Gateway Timeout"
+    };
+    STATUS_CLAUSES = {
+      400: "the request was rejected as invalid",
+      401: "the request was not authorised",
+      403: "the request was forbidden",
+      404: "it was not found",
+      409: "it conflicts with something that already exists",
+      410: "it is gone",
+      429: "the rate limit was reached"
+    };
+    SECRET_KEYS = [
+      "access_token",
+      "refresh_token",
+      "id_token",
+      "client_secret",
+      "client_id",
+      "authorization",
+      "proxy-authorization",
+      "cookie",
+      "set-cookie",
+      "api_key",
+      "apikey",
+      "x-goog-api-key"
+    ];
+    REDACTED = "<redacted>";
+    KEY_ALTERNATION = SECRET_KEYS.join("|");
+    JSON_SECRET = new RegExp(
+      `(["']?(?:${KEY_ALTERNATION})["']?\\s*[:=]\\s*)(["'])[^"']*(["'])`,
+      "gi"
+    );
+    HEADER_SECRET = new RegExp(`^(\\s*(?:${KEY_ALTERNATION})\\s*:\\s*)[^\\r\\n]+`, "gim");
+    QUERY_SECRET = new RegExp(`((?:${KEY_ALTERNATION})=)[^&\\s"']+`, "gi");
+    BEARER = /\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi;
+    EnvelopeError = class extends Error {
+      envelopeCode;
+      summary;
+      statusLine;
+      body;
+      status;
+      constructor(parts) {
+        super(formatEnvelope(parts));
+        this.name = "EnvelopeError";
+        this.envelopeCode = parts.code;
+        this.summary = parts.summary;
+        this.statusLine = parts.statusLine;
+        this.body = parts.body;
+        this.status = parts.status;
+      }
+      /** The full envelope text. */
+      get envelope() {
+        return this.message;
+      }
+    };
+    LEADING_CODE = /^\[[a-z][a-z0-9_]*\]\s+\S/;
+    RPC_CODES = {
+      "-32602": { code: "bad_request", clause: "the arguments were not valid" },
+      "-32601": { code: "unknown_tool", clause: "there is no such tool" },
+      "-32600": { code: "bad_request", clause: "the request was not valid" },
+      "-32603": { code: "internal_error" },
+      "-32700": { code: "bad_request", clause: "the request could not be parsed" }
+    };
+    RPC_PREFIX = /^MCP error (-?\d+):\s*/;
+  }
+});
+
 // src/auth/paths.js
 var paths_exports = {};
 __export(paths_exports, {
@@ -177,42 +377,51 @@ async function loadCredentialsWithFallback() {
   try {
     return await loadCredentialsFromFile();
   } catch (fileError) {
-    const errorMessage = generateCredentialsErrorMessage();
-    throw new Error(`${errorMessage}
-
-Original error: ${fileError instanceof Error ? fileError.message : fileError}`);
+    process.stderr.write(generateCredentialsErrorMessage() + "\n\n");
+    throw localEnvelopeError(
+      "no_credentials",
+      `No Google OAuth credentials could be read from ${getKeysFilePath()}.`,
+      fileError instanceof Error ? fileError.message : String(fileError)
+    );
   }
 }
 async function initializeOAuth2Client() {
-  try {
-    const credentials = await loadCredentialsWithFallback();
-    return new OAuth2Client({
-      clientId: credentials.client_id,
-      clientSecret: credentials.client_secret,
-      redirectUri: credentials.redirect_uris[0]
-    });
-  } catch (error) {
-    throw new Error(`Error loading OAuth keys: ${error instanceof Error ? error.message : error}`);
-  }
+  const credentials = await loadCredentialsWithFallback();
+  return new OAuth2Client({
+    clientId: credentials.client_id,
+    clientSecret: credentials.client_secret,
+    redirectUri: credentials.redirect_uris[0]
+  });
 }
 async function loadCredentials() {
   try {
     const credentials = await loadCredentialsWithFallback();
     if (!credentials.client_id || !credentials.client_secret) {
-      throw new Error("Client ID or Client Secret missing in credentials.");
+      throw localEnvelopeError(
+        "no_credentials",
+        `The credentials file ${getKeysFilePath()} has no client_id or client_secret.`
+      );
     }
     return {
       client_id: credentials.client_id,
       client_secret: credentials.client_secret
     };
   } catch (error) {
-    throw new Error(`Error loading credentials: ${error instanceof Error ? error.message : error}`);
+    if (isEnvelopeError(error)) {
+      throw error;
+    }
+    throw localEnvelopeError(
+      "no_credentials",
+      `No Google OAuth credentials could be read from ${getKeysFilePath()}.`,
+      error instanceof Error ? error.message : String(error)
+    );
   }
 }
 var init_client = __esm({
   "src/auth/client.ts"() {
     "use strict";
     init_utils();
+    init_failure_envelope();
   }
 });
 
@@ -223,178 +432,8 @@ import { fileURLToPath as fileURLToPath4 } from "url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { McpError as McpError2, ErrorCode as ErrorCode2 } from "@modelcontextprotocol/sdk/types.js";
 
-// src/utils/failure-envelope.ts
-var MAX_BODY_CHARS = 4e3;
-var TRUNCATION_MARKER = " ...[truncated]";
-var REASON_PHRASES = {
-  400: "Bad Request",
-  401: "Unauthorized",
-  402: "Payment Required",
-  403: "Forbidden",
-  404: "Not Found",
-  405: "Method Not Allowed",
-  406: "Not Acceptable",
-  408: "Request Timeout",
-  409: "Conflict",
-  410: "Gone",
-  412: "Precondition Failed",
-  413: "Payload Too Large",
-  415: "Unsupported Media Type",
-  422: "Unprocessable Entity",
-  423: "Locked",
-  428: "Precondition Required",
-  429: "Too Many Requests",
-  500: "Internal Server Error",
-  501: "Not Implemented",
-  502: "Bad Gateway",
-  503: "Service Unavailable",
-  504: "Gateway Timeout"
-};
-var STATUS_CLAUSES = {
-  400: "the request was rejected as invalid",
-  401: "the request was not authorised",
-  403: "the request was forbidden",
-  404: "it was not found",
-  409: "it conflicts with something that already exists",
-  410: "it is gone",
-  429: "the rate limit was reached"
-};
-var SECRET_KEYS = [
-  "access_token",
-  "refresh_token",
-  "id_token",
-  "client_secret",
-  "client_id",
-  "authorization",
-  "proxy-authorization",
-  "cookie",
-  "set-cookie",
-  "api_key",
-  "apikey",
-  "x-goog-api-key"
-];
-var REDACTED = "<redacted>";
-var KEY_ALTERNATION = SECRET_KEYS.join("|");
-var JSON_SECRET = new RegExp(
-  `(["']?(?:${KEY_ALTERNATION})["']?\\s*[:=]\\s*)(["'])[^"']*(["'])`,
-  "gi"
-);
-var HEADER_SECRET = new RegExp(`^(\\s*(?:${KEY_ALTERNATION})\\s*:\\s*)[^\\r\\n]+`, "gim");
-var QUERY_SECRET = new RegExp(`((?:${KEY_ALTERNATION})=)[^&\\s"']+`, "gi");
-var BEARER = /\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi;
-function redactSecrets(input) {
-  if (!input) return input;
-  return input.replace(JSON_SECRET, (_m, prefix, openQuote, closeQuote) => `${prefix}${openQuote}${REDACTED}${closeQuote}`).replace(HEADER_SECRET, (_m, prefix) => `${prefix}${REDACTED}`).replace(QUERY_SECRET, (_m, prefix) => `${prefix}${REDACTED}`).replace(BEARER, (_m, scheme) => `${scheme} ${REDACTED}`);
-}
-function capBody(body) {
-  if (body.length <= MAX_BODY_CHARS) return body;
-  return body.slice(0, MAX_BODY_CHARS) + TRUNCATION_MARKER;
-}
-function bodyToText(body) {
-  if (body === void 0 || body === null) return void 0;
-  if (typeof body === "string") return body;
-  try {
-    return JSON.stringify(body);
-  } catch {
-    return String(body);
-  }
-}
-function reasonPhrase(status, literal) {
-  if (literal && literal.trim().length > 0) return literal.trim();
-  return REASON_PHRASES[status] ?? "";
-}
-function statusLineFor(status, literal) {
-  const phrase = reasonPhrase(status, literal);
-  return phrase ? `HTTP ${status} ${phrase}` : `HTTP ${status}`;
-}
-function summaryForStatus(action, status) {
-  const clause = STATUS_CLAUSES[status] ?? (status >= 500 ? "Google reported a server error" : void 0);
-  return clause ? `Could not ${action}: ${clause}.` : `Could not ${action}.`;
-}
-function formatEnvelope(parts) {
-  const lines = [`[${parts.code}] ${parts.summary}`];
-  if (parts.statusLine) lines.push(parts.statusLine);
-  const body = parts.body === void 0 ? void 0 : capBody(redactSecrets(parts.body));
-  if (body !== void 0 && body.length > 0) lines.push(body);
-  return lines.join("\n");
-}
-var EnvelopeError = class extends Error {
-  envelopeCode;
-  summary;
-  statusLine;
-  body;
-  status;
-  constructor(parts) {
-    super(formatEnvelope(parts));
-    this.name = "EnvelopeError";
-    this.envelopeCode = parts.code;
-    this.summary = parts.summary;
-    this.statusLine = parts.statusLine;
-    this.body = parts.body;
-    this.status = parts.status;
-  }
-  /** The full envelope text. */
-  get envelope() {
-    return this.message;
-  }
-};
-function httpEnvelopeError(options) {
-  return new EnvelopeError({
-    code: `http_${options.status}`,
-    summary: options.summary ?? summaryForStatus(options.action, options.status),
-    statusLine: statusLineFor(options.status, options.statusText),
-    body: bodyToText(options.body),
-    status: options.status
-  });
-}
-function localEnvelopeError(code, summary, body) {
-  return new EnvelopeError({ code, summary, body });
-}
-function isEnvelopeError(error) {
-  return error instanceof EnvelopeError;
-}
-function envelopeErrorFor(error, action) {
-  if (isEnvelopeError(error)) return error;
-  const response = error?.response;
-  const status = response?.status ?? (typeof error?.code === "number" ? error.code : void 0);
-  if (typeof status === "number") {
-    return httpEnvelopeError({
-      action,
-      status,
-      statusText: response?.statusText,
-      body: response?.data ?? (error instanceof Error ? error.message : void 0)
-    });
-  }
-  const transportCode = String(error?.code ?? "").toUpperCase();
-  if (transportCode) {
-    const code = transportCode === "ETIMEDOUT" || transportCode === "ECONNABORTED" || transportCode === "ERR_CANCELED" ? "timeout" : "network_error";
-    return localEnvelopeError(
-      code,
-      `Could not ${action}: the request did not complete.`,
-      error instanceof Error ? error.message : String(error)
-    );
-  }
-  if (error instanceof Error) {
-    const code = error.name === "ZodError" ? "bad_request" : "internal_error";
-    return localEnvelopeError(code, `Could not ${action}.`, error.message);
-  }
-  return localEnvelopeError(
-    "internal_error",
-    `Could not ${action}.`,
-    typeof error === "string" ? error : bodyToText(error)
-  );
-}
-function envelopeTextFor(error, action) {
-  return envelopeErrorFor(error, action).envelope;
-}
-function toEnvelopeResult(error, action) {
-  return {
-    isError: true,
-    content: [{ type: "text", text: envelopeTextFor(error, action) }]
-  };
-}
-
 // src/circuitBuffer.ts
+init_failure_envelope();
 var THRESHOLD = 200;
 function cfg() {
   const url = (process.env.MAESTRO_CIRCUIT_URL || "").trim();
@@ -464,7 +503,9 @@ async function wrapResult(result) {
 }
 
 // src/server.ts
+init_failure_envelope();
 init_client();
+import { OAuth2Client as OAuth2Client4 } from "google-auth-library";
 import { readFileSync as readFileSync2 } from "fs";
 import { join as join2, dirname as dirname3 } from "path";
 import { fileURLToPath as fileURLToPath3 } from "url";
@@ -1458,6 +1499,7 @@ var AuthServer = class {
 import { z } from "zod";
 
 // src/utils/field-mask-builder.ts
+init_failure_envelope();
 var ALLOWED_EVENT_FIELDS = [
   "id",
   "summary",
@@ -1552,6 +1594,9 @@ function buildListFieldMask(requestedFields, includeDefaults = true) {
   }
   return `${eventFieldMask},nextPageToken,nextSyncToken,kind,etag,summary,updated,timeZone,accessRole,defaultReminders`;
 }
+
+// src/tools/registry.ts
+init_failure_envelope();
 
 // src/handlers/core/BaseToolHandler.ts
 init_utils();
@@ -1869,6 +1914,7 @@ var CalendarRegistry = class _CalendarRegistry {
 init_paths();
 
 // src/utils/datetime.ts
+init_failure_envelope();
 function hasTimezoneInDatetime(datetime) {
   return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(Z|[+-]\d{2}:\d{2})$/.test(datetime);
 }
@@ -1960,6 +2006,7 @@ function createTimeObject(input, fallbackTimezone) {
 }
 
 // src/handlers/core/BaseToolHandler.ts
+init_failure_envelope();
 var BaseToolHandler = class {
   calendarRegistry = CalendarRegistry.getInstance();
   /**
@@ -2677,6 +2724,7 @@ var ListCalendarsHandler = class extends BaseToolHandler {
 };
 
 // src/handlers/core/BatchRequestHandler.ts
+init_failure_envelope();
 var BatchRequestError = class extends EnvelopeError {
   constructor(summary, errors, partial = false, envelope) {
     super({
@@ -3029,6 +3077,7 @@ function convertGoogleEventToStructured(event, calendarId, accountId2) {
 }
 
 // src/handlers/core/ListEventsHandler.ts
+init_failure_envelope();
 var ListEventsHandler = class extends BaseToolHandler {
   async runTool(args, accounts) {
     const selectedAccounts = this.getClientsForAccounts(args.account, accounts);
@@ -3223,6 +3272,7 @@ var ListEventsHandler = class extends BaseToolHandler {
 };
 
 // src/handlers/core/SearchEventsHandler.ts
+init_failure_envelope();
 var SearchEventsHandler = class extends BaseToolHandler {
   async runTool(args, accounts) {
     const validArgs = args;
@@ -3348,6 +3398,7 @@ var SearchEventsHandler = class extends BaseToolHandler {
 };
 
 // src/handlers/core/GetEventHandler.ts
+init_failure_envelope();
 var GetEventHandler = class extends BaseToolHandler {
   async runTool(args, accounts) {
     const validArgs = args;
@@ -3387,6 +3438,7 @@ var GetEventHandler = class extends BaseToolHandler {
 };
 
 // src/handlers/core/ListColorsHandler.ts
+init_failure_envelope();
 var ListColorsHandler = class extends BaseToolHandler {
   async runTool(args, accounts) {
     const oauth2Client = this.getClientForAccountOrFirst(args.account, accounts);
@@ -3428,6 +3480,7 @@ var ListColorsHandler = class extends BaseToolHandler {
 };
 
 // src/utils/event-id-validator.ts
+init_failure_envelope();
 function isValidEventId(eventId) {
   if (eventId.length < 5 || eventId.length > 1024) {
     return false;
@@ -3870,6 +3923,7 @@ var ConflictDetectionService = class {
 };
 
 // src/handlers/core/CreateEventHandler.ts
+init_failure_envelope();
 var CreateEventHandler = class extends BaseToolHandler {
   conflictDetectionService;
   constructor() {
@@ -4062,6 +4116,7 @@ var CreateEventHandler = class extends BaseToolHandler {
 };
 
 // src/handlers/core/CreateEventsHandler.ts
+init_failure_envelope();
 var CreateEventsHandler = class extends BaseToolHandler {
   async runTool(args, accounts) {
     const validArgs = args;
@@ -4193,6 +4248,7 @@ var CreateEventsHandler = class extends BaseToolHandler {
 };
 
 // src/handlers/core/RecurringEventHelpers.ts
+init_failure_envelope();
 var RecurringEventHelpers = class {
   calendar;
   constructor(calendar) {
@@ -4339,6 +4395,7 @@ var RECURRING_EVENT_ERRORS = {
 };
 
 // src/handlers/core/UpdateEventHandler.ts
+init_failure_envelope();
 var UpdateEventHandler = class extends BaseToolHandler {
   conflictDetectionService;
   constructor() {
@@ -4600,6 +4657,7 @@ var DeleteEventHandler = class extends BaseToolHandler {
 };
 
 // src/handlers/core/FreeBusyEventHandler.ts
+init_failure_envelope();
 var FreeBusyEventHandler = class extends BaseToolHandler {
   async runTool(args, accounts) {
     const validArgs = args;
@@ -4899,6 +4957,7 @@ var GetCurrentTimeHandler = class extends BaseToolHandler {
 };
 
 // src/handlers/core/RespondToEventHandler.ts
+init_failure_envelope();
 var RespondToEventHandler = class extends BaseToolHandler {
   async runTool(args, accounts) {
     const validArgs = args;
@@ -5853,6 +5912,7 @@ var ToolRegistry = class {
 
 // src/handlers/core/ManageAccountsHandler.ts
 init_paths();
+init_failure_envelope();
 import { google as google4 } from "googleapis";
 var ManageAccountsHandler = class {
   async runTool(args, context) {
@@ -6157,10 +6217,10 @@ var HttpTransportHandler = class {
    * Consolidates credential loading and redirect URI construction.
    */
   async createOAuth2Client(accountId2, host, port) {
-    const { OAuth2Client: OAuth2Client4 } = await import("google-auth-library");
+    const { OAuth2Client: OAuth2Client5 } = await import("google-auth-library");
     const { loadCredentials: loadCredentials2 } = await Promise.resolve().then(() => (init_client(), client_exports));
     const { client_id, client_secret } = await loadCredentials2();
-    return new OAuth2Client4(
+    return new OAuth2Client5(
       client_id,
       client_secret,
       `http://${host}:${port}/oauth2callback?account=${accountId2}`
@@ -6477,6 +6537,11 @@ var GoogleCalendarMcpServer = class {
   authServer;
   config;
   accounts;
+  // Set when the credentials file could not be read. The server still starts and still advertises
+  // every tool; each call answers with this envelope instead. A server that refuses to start is a
+  // DEAD extension: it resolves to nothing, the turn opens with an empty toolbox, and the step
+  // fails silently. A server that starts and says [no_credentials] can be acted on.
+  credentialsFailure;
   constructor(config) {
     this.config = config;
     this.server = new McpServer({
@@ -6485,14 +6550,26 @@ var GoogleCalendarMcpServer = class {
     });
   }
   async initialize() {
-    this.oauth2Client = await initializeOAuth2Client();
-    this.tokenManager = new TokenManager(this.oauth2Client);
-    this.authServer = new AuthServer(this.oauth2Client);
-    this.accounts = await this.tokenManager.loadAllAccounts();
-    await this.handleStartupAuthentication();
+    try {
+      this.oauth2Client = await initializeOAuth2Client();
+      this.tokenManager = new TokenManager(this.oauth2Client);
+      this.authServer = new AuthServer(this.oauth2Client);
+      this.accounts = await this.tokenManager.loadAllAccounts();
+      await this.handleStartupAuthentication();
+    } catch (error) {
+      this.credentialsFailure = envelopeErrorFor(error, "read the Google credentials");
+      process.stderr.write(`${this.credentialsFailure.envelope}
+`);
+      process.stderr.write("The server is starting anyway; every tool will report this failure until it is resolved.\n");
+      this.oauth2Client = new OAuth2Client4();
+      this.tokenManager = new TokenManager(this.oauth2Client);
+      this.authServer = new AuthServer(this.oauth2Client);
+      this.accounts = /* @__PURE__ */ new Map();
+    }
     this.registerTools();
     this.registerPrompts();
     this.registerResources();
+    this.guardToolResults();
     this.setupGracefulShutdown();
   }
   async handleStartupAuthentication() {
@@ -6578,12 +6655,35 @@ var GoogleCalendarMcpServer = class {
       },
       async (args) => {
         try {
+          if (this.credentialsFailure) {
+            throw this.credentialsFailure;
+          }
           return await manageAccountsHandler.runTool(args, serverContext);
         } catch (error) {
           return toEnvelopeResult(error, "manage the connected accounts");
         }
       }
     );
+  }
+  /**
+   * Wraps the SDK's tools/call handler so that EVERY failing tool result leaves as the envelope.
+   *
+   * The funnel in ToolRegistry catches everything our own code can throw, but the SDK validates
+   * arguments against the registered input schema before that funnel is reached, and reports a
+   * rejection as `isError: true` with the text "MCP error -32602: ...". Rule 2 says nothing comes
+   * before the code, so that result is re-shaped here, at the outermost point a result exists.
+   */
+  guardToolResults() {
+    const handlers = this.server.server?._requestHandlers;
+    const inner = handlers?.get("tools/call");
+    if (!handlers || !inner) {
+      process.stderr.write("WARNING: could not wrap the tools/call handler; argument-validation failures will not carry the failure envelope.\n");
+      return;
+    }
+    handlers.set("tools/call", async (request, extra) => {
+      const result = await inner(request, extra);
+      return ensureEnvelope(result, `run ${request?.params?.name ?? "the tool"}`);
+    });
   }
   registerPrompts() {
     this.server.registerPrompt(
@@ -6750,6 +6850,9 @@ Do not create an event before confirmation.`
     );
   }
   async ensureAuthenticated() {
+    if (this.credentialsFailure) {
+      throw this.credentialsFailure;
+    }
     const availableAccounts = await this.tokenManager.loadAllAccounts();
     if (availableAccounts.size > 0) {
       this.accounts = availableAccounts;

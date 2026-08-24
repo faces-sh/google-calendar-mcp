@@ -105,6 +105,74 @@ To get OAuth credentials:
 `.trim();
 }
 
+// src/utils/failure-envelope.ts
+var MAX_BODY_CHARS = 4e3;
+var TRUNCATION_MARKER = " ...[truncated]";
+var SECRET_KEYS = [
+  "access_token",
+  "refresh_token",
+  "id_token",
+  "client_secret",
+  "client_id",
+  "authorization",
+  "proxy-authorization",
+  "cookie",
+  "set-cookie",
+  "api_key",
+  "apikey",
+  "x-goog-api-key"
+];
+var REDACTED = "<redacted>";
+var KEY_ALTERNATION = SECRET_KEYS.join("|");
+var JSON_SECRET = new RegExp(
+  `(["']?(?:${KEY_ALTERNATION})["']?\\s*[:=]\\s*)(["'])[^"']*(["'])`,
+  "gi"
+);
+var HEADER_SECRET = new RegExp(`^(\\s*(?:${KEY_ALTERNATION})\\s*:\\s*)[^\\r\\n]+`, "gim");
+var QUERY_SECRET = new RegExp(`((?:${KEY_ALTERNATION})=)[^&\\s"']+`, "gi");
+var BEARER = /\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi;
+function redactSecrets(input) {
+  if (!input) return input;
+  return input.replace(JSON_SECRET, (_m, prefix, openQuote, closeQuote) => `${prefix}${openQuote}${REDACTED}${closeQuote}`).replace(HEADER_SECRET, (_m, prefix) => `${prefix}${REDACTED}`).replace(QUERY_SECRET, (_m, prefix) => `${prefix}${REDACTED}`).replace(BEARER, (_m, scheme) => `${scheme} ${REDACTED}`);
+}
+function capBody(body) {
+  if (body.length <= MAX_BODY_CHARS) return body;
+  return body.slice(0, MAX_BODY_CHARS) + TRUNCATION_MARKER;
+}
+function formatEnvelope(parts) {
+  const lines = [`[${parts.code}] ${parts.summary}`];
+  if (parts.statusLine) lines.push(parts.statusLine);
+  const body = parts.body === void 0 ? void 0 : capBody(redactSecrets(parts.body));
+  if (body !== void 0 && body.length > 0) lines.push(body);
+  return lines.join("\n");
+}
+var EnvelopeError = class extends Error {
+  envelopeCode;
+  summary;
+  statusLine;
+  body;
+  status;
+  constructor(parts) {
+    super(formatEnvelope(parts));
+    this.name = "EnvelopeError";
+    this.envelopeCode = parts.code;
+    this.summary = parts.summary;
+    this.statusLine = parts.statusLine;
+    this.body = parts.body;
+    this.status = parts.status;
+  }
+  /** The full envelope text. */
+  get envelope() {
+    return this.message;
+  }
+};
+function localEnvelopeError(code, summary, body) {
+  return new EnvelopeError({ code, summary, body });
+}
+function isEnvelopeError(error) {
+  return error instanceof EnvelopeError;
+}
+
 // src/auth/client.ts
 async function loadCredentialsFromFile() {
   const keysContent = await fs.readFile(getKeysFilePath(), "utf-8");
@@ -126,36 +194,44 @@ async function loadCredentialsWithFallback() {
   try {
     return await loadCredentialsFromFile();
   } catch (fileError) {
-    const errorMessage = generateCredentialsErrorMessage();
-    throw new Error(`${errorMessage}
-
-Original error: ${fileError instanceof Error ? fileError.message : fileError}`);
+    process.stderr.write(generateCredentialsErrorMessage() + "\n\n");
+    throw localEnvelopeError(
+      "no_credentials",
+      `No Google OAuth credentials could be read from ${getKeysFilePath()}.`,
+      fileError instanceof Error ? fileError.message : String(fileError)
+    );
   }
 }
 async function initializeOAuth2Client() {
-  try {
-    const credentials = await loadCredentialsWithFallback();
-    return new OAuth2Client({
-      clientId: credentials.client_id,
-      clientSecret: credentials.client_secret,
-      redirectUri: credentials.redirect_uris[0]
-    });
-  } catch (error) {
-    throw new Error(`Error loading OAuth keys: ${error instanceof Error ? error.message : error}`);
-  }
+  const credentials = await loadCredentialsWithFallback();
+  return new OAuth2Client({
+    clientId: credentials.client_id,
+    clientSecret: credentials.client_secret,
+    redirectUri: credentials.redirect_uris[0]
+  });
 }
 async function loadCredentials() {
   try {
     const credentials = await loadCredentialsWithFallback();
     if (!credentials.client_id || !credentials.client_secret) {
-      throw new Error("Client ID or Client Secret missing in credentials.");
+      throw localEnvelopeError(
+        "no_credentials",
+        `The credentials file ${getKeysFilePath()} has no client_id or client_secret.`
+      );
     }
     return {
       client_id: credentials.client_id,
       client_secret: credentials.client_secret
     };
   } catch (error) {
-    throw new Error(`Error loading credentials: ${error instanceof Error ? error.message : error}`);
+    if (isEnvelopeError(error)) {
+      throw error;
+    }
+    throw localEnvelopeError(
+      "no_credentials",
+      `No Google OAuth credentials could be read from ${getKeysFilePath()}.`,
+      error instanceof Error ? error.message : String(error)
+    );
   }
 }
 

@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { CallToolResult, McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import { resolveArgs, wrapResult } from "./circuitBuffer.js";
-import { envelopeTextFor, isEnvelopeError, localEnvelopeError, toEnvelopeResult } from "./utils/failure-envelope.js";
+import { EnvelopeError, ensureEnvelope, envelopeErrorFor, envelopeTextFor, isEnvelopeError, localEnvelopeError, toEnvelopeResult } from "./utils/failure-envelope.js";
 
 import { OAuth2Client } from "google-auth-library";
 import { readFileSync } from "fs";
@@ -39,6 +39,11 @@ export class GoogleCalendarMcpServer {
   private authServer!: AuthServer;
   private config: ServerConfig;
   private accounts!: Map<string, OAuth2Client>;
+  // Set when the credentials file could not be read. The server still starts and still advertises
+  // every tool; each call answers with this envelope instead. A server that refuses to start is a
+  // DEAD extension: it resolves to nothing, the turn opens with an empty toolbox, and the step
+  // fails silently. A server that starts and says [no_credentials] can be acted on.
+  private credentialsFailure?: EnvelopeError;
 
   constructor(config: ServerConfig) {
     this.config = config;
@@ -49,21 +54,35 @@ export class GoogleCalendarMcpServer {
   }
 
   async initialize(): Promise<void> {
-    // 1. Initialize Authentication (but don't block on it)
-    this.oauth2Client = await initializeOAuth2Client();
-    this.tokenManager = new TokenManager(this.oauth2Client);
-    this.authServer = new AuthServer(this.oauth2Client);
+    // 1. Initialize Authentication (but don't block on it). A missing or unreadable credentials
+    //    file is remembered, not fatal: see credentialsFailure.
+    try {
+      this.oauth2Client = await initializeOAuth2Client();
+      this.tokenManager = new TokenManager(this.oauth2Client);
+      this.authServer = new AuthServer(this.oauth2Client);
 
-    // 2. Load all authenticated accounts
-    this.accounts = await this.tokenManager.loadAllAccounts();
+      // 2. Load all authenticated accounts
+      this.accounts = await this.tokenManager.loadAllAccounts();
 
-    // 3. Handle startup authentication based on transport type
-    await this.handleStartupAuthentication();
+      // 3. Handle startup authentication based on transport type
+      await this.handleStartupAuthentication();
+    } catch (error) {
+      this.credentialsFailure = envelopeErrorFor(error, 'read the Google credentials');
+      process.stderr.write(`${this.credentialsFailure.envelope}\n`);
+      process.stderr.write('The server is starting anyway; every tool will report this failure until it is resolved.\n');
+      // Placeholder wiring so the rest of the server is fully constructed. Nothing reaches it:
+      // every tool path checks credentialsFailure first.
+      this.oauth2Client = new OAuth2Client();
+      this.tokenManager = new TokenManager(this.oauth2Client);
+      this.authServer = new AuthServer(this.oauth2Client);
+      this.accounts = new Map();
+    }
 
     // 4. Set up Modern Tool Definitions
     this.registerTools();
     this.registerPrompts();
     this.registerResources();
+    this.guardToolResults();
 
     // 5. Set up Graceful Shutdown
     this.setupGracefulShutdown();
@@ -162,12 +181,41 @@ export class GoogleCalendarMcpServer {
       async (args) => {
         // Same envelope funnel as every other tool (docs/MCP_FAILURE_ENVELOPE.md).
         try {
+          if (this.credentialsFailure) {
+            throw this.credentialsFailure;
+          }
           return await manageAccountsHandler.runTool(args, serverContext);
         } catch (error) {
           return toEnvelopeResult(error, 'manage the connected accounts');
         }
       }
     );
+  }
+
+  /**
+   * Wraps the SDK's tools/call handler so that EVERY failing tool result leaves as the envelope.
+   *
+   * The funnel in ToolRegistry catches everything our own code can throw, but the SDK validates
+   * arguments against the registered input schema before that funnel is reached, and reports a
+   * rejection as `isError: true` with the text "MCP error -32602: ...". Rule 2 says nothing comes
+   * before the code, so that result is re-shaped here, at the outermost point a result exists.
+   */
+  private guardToolResults(): void {
+    const handlers: Map<string, (request: any, extra: any) => Promise<unknown>> | undefined =
+      (this.server.server as any)?._requestHandlers;
+    const inner = handlers?.get('tools/call');
+
+    if (!handlers || !inner) {
+      // Said out loud rather than swallowed: without this wrapper, the SDK's own validation
+      // failures reach the caller without an envelope.
+      process.stderr.write('WARNING: could not wrap the tools/call handler; argument-validation failures will not carry the failure envelope.\n');
+      return;
+    }
+
+    handlers.set('tools/call', async (request: any, extra: any) => {
+      const result = await inner(request, extra);
+      return ensureEnvelope(result, `run ${request?.params?.name ?? 'the tool'}`);
+    });
   }
 
   private registerPrompts(): void {
@@ -341,6 +389,11 @@ export class GoogleCalendarMcpServer {
   }
 
   private async ensureAuthenticated(): Promise<void> {
+    // No credentials file: the same failure every time, with the path it looked for.
+    if (this.credentialsFailure) {
+      throw this.credentialsFailure;
+    }
+
     const availableAccounts = await this.tokenManager.loadAllAccounts();
     if (availableAccounts.size > 0) {
       this.accounts = availableAccounts;

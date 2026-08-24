@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   MAX_BODY_CHARS,
   capBody,
+  ensureEnvelope,
   envelopeErrorFor,
   envelopeTextFor,
   formatEnvelope,
@@ -148,6 +149,44 @@ describe('failure envelope', () => {
       const error: any = new Error('timeout of 3000ms exceeded');
       error.code = 'ETIMEDOUT';
       expect(envelopeErrorFor(error, 'list the events').envelopeCode).toBe('timeout');
+    });
+  });
+
+  describe('the outermost guard', () => {
+    // The MCP SDK validates arguments against the registered schema BEFORE our own funnel runs,
+    // and reports a rejection as isError with text that opens "MCP error -32602: ...". Rule 2 says
+    // nothing comes before the code.
+    function sdkResult(text: string) {
+      return { isError: true, content: [{ type: 'text', text }] };
+    }
+
+    it('re-shapes an SDK argument rejection, keeping its complaint as the evidence', () => {
+      const guarded: any = ensureEnvelope(
+        sdkResult('MCP error -32602: Input validation error: Invalid arguments for tool get-freebusy: [{"path":["timeMin"]}]'),
+        'run get-freebusy'
+      );
+
+      expect(guarded.content[0].text).toBe(
+        '[bad_request] Could not run get-freebusy: the arguments were not valid.\n' +
+        'Input validation error: Invalid arguments for tool get-freebusy: [{"path":["timeMin"]}]'
+      );
+    });
+
+    it('maps an unknown tool and an internal error to their own codes', () => {
+      expect((ensureEnvelope(sdkResult('MCP error -32601: Tool nope not found'), 'run nope') as any).content[0].text)
+        .toContain('[unknown_tool]');
+      expect((ensureEnvelope(sdkResult('MCP error -32603: something broke'), 'run x') as any).content[0].text)
+        .toContain('[internal_error]');
+    });
+
+    it('leaves a result that is already an envelope exactly as it is', () => {
+      const already = sdkResult('[http_403] Could not list the calendars: the request was forbidden.\nHTTP 403 Forbidden\n{}');
+      expect(ensureEnvelope(already, 'run list-calendars')).toBe(already);
+    });
+
+    it('leaves a successful result alone', () => {
+      const ok = { content: [{ type: 'text', text: '{"events":[]}' }] };
+      expect(ensureEnvelope(ok, 'run list-events')).toBe(ok);
     });
   });
 
