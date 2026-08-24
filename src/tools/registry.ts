@@ -1,9 +1,10 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import type { ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
+import type { CallToolResult, ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { BaseToolHandler } from "../handlers/core/BaseToolHandler.js";
 import { ALLOWED_EVENT_FIELDS } from "../utils/field-mask-builder.js";
 import { ServerConfig } from "../config/TransportConfig.js";
+import { localEnvelopeError, toEnvelopeResult } from "../utils/failure-envelope.js";
 
 // Import all handlers
 import { ListCalendarsHandler } from "../handlers/core/ListCalendarsHandler.js";
@@ -886,8 +887,10 @@ export class ToolRegistry {
 
             processedCalendarId = parsed;
           } catch (error) {
-            throw new Error(
-              `Invalid JSON format for calendarId: ${error instanceof Error ? error.message : 'Unknown parsing error'}`
+            throw localEnvelopeError(
+              'bad_request',
+              'The calendarId argument was not a calendar id or a list of calendar ids.',
+              error instanceof Error ? error.message : undefined
             );
           }
         }
@@ -1076,7 +1079,7 @@ export class ToolRegistry {
     executeWithHandler: (
       handler: any,
       args: any
-    ) => Promise<{ content: Array<{ type: "text"; text: string }> }>,
+    ) => Promise<CallToolResult>,
     config?: ServerConfig
   ) {
     // Validate enabledTools if provided
@@ -1110,7 +1113,7 @@ export class ToolRegistry {
     executeWithHandler: (
       handler: any,
       args: any
-    ) => Promise<{ content: Array<{ type: "text"; text: string }> }>
+    ) => Promise<CallToolResult>
   ) {
     // Use the existing registerTool method which handles schema conversion properly
     server.registerTool(
@@ -1122,19 +1125,25 @@ export class ToolRegistry {
           annotations: tool.annotations
         },
         async (args: any) => {
-          // Preprocess: Normalize datetime fields (convert object format to string format)
-          // This allows accepting both formats while keeping schemas simple
-          const normalizedArgs = this.normalizeDateTimeFields(tool.name, args);
+          // Every failure of this tool leaves through here, and leaves as the uniform envelope
+          // (docs/MCP_FAILURE_ENVELOPE.md): isError: true, and text that begins with [<code>].
+          try {
+            // Preprocess: Normalize datetime fields (convert object format to string format)
+            // This allows accepting both formats while keeping schemas simple
+            const normalizedArgs = this.normalizeDateTimeFields(tool.name, args);
 
-          // Validate input using our Zod schema
-          const validatedArgs = tool.schema.parse(normalizedArgs);
+            // Validate input using our Zod schema
+            const validatedArgs = tool.schema.parse(normalizedArgs);
 
-          // Apply any custom handler function preprocessing
-          const processedArgs = tool.handlerFunction ? await tool.handlerFunction(validatedArgs) : validatedArgs;
+            // Apply any custom handler function preprocessing
+            const processedArgs = tool.handlerFunction ? await tool.handlerFunction(validatedArgs) : validatedArgs;
 
-          // Create handler instance and execute
-          const handler = new tool.handler();
-          return executeWithHandler(handler, processedArgs);
+            // Create handler instance and execute
+            const handler = new tool.handler();
+            return await executeWithHandler(handler, processedArgs);
+          } catch (error) {
+            return toEnvelopeResult(error, `run ${tool.name}`);
+          }
         }
       );
   }

@@ -4,6 +4,7 @@ import { BaseToolHandler } from "./BaseToolHandler.js";
 import { calendar_v3 } from "googleapis";
 import { createStructuredResponse } from "../../utils/response-builder.js";
 import { ListColorsResponse } from "../../types/structured-responses.js";
+import { localEnvelopeError } from "../../utils/failure-envelope.js";
 
 export class ListColorsHandler extends BaseToolHandler {
     async runTool(args: any, accounts: Map<string, OAuth2Client>): Promise<CallToolResult> {
@@ -44,10 +45,12 @@ export class ListColorsHandler extends BaseToolHandler {
         try {
             const calendar = this.getCalendar(client);
             const response = await calendar.colors.get();
-            if (!response.data) throw new Error('Failed to retrieve colors');
+            if (!response.data) {
+                throw localEnvelopeError('unexpected_response', 'Google returned no colours.');
+            }
             return response.data;
         } catch (error) {
-            throw this.handleGoogleApiError(error);
+            throw this.handleGoogleApiError(error, 'list the calendar colours');
         }
     }
 

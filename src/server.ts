@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
+import { CallToolResult, McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import { resolveArgs, wrapResult } from "./circuitBuffer.js";
+import { envelopeTextFor, isEnvelopeError, localEnvelopeError, toEnvelopeResult } from "./utils/failure-envelope.js";
 
 import { OAuth2Client } from "google-auth-library";
 import { readFileSync } from "fs";
@@ -159,7 +160,12 @@ export class GoogleCalendarMcpServer {
         }
       },
       async (args) => {
-        return manageAccountsHandler.runTool(args, serverContext);
+        // Same envelope funnel as every other tool (docs/MCP_FAILURE_ENVELOPE.md).
+        try {
+          return await manageAccountsHandler.runTool(args, serverContext);
+        } catch (error) {
+          return toEnvelopeResult(error, 'manage the connected accounts');
+        }
       }
     );
   }
@@ -324,12 +330,10 @@ export class GoogleCalendarMcpServer {
             ]
           };
         } catch (error) {
-          if (error instanceof McpError) {
-            throw error;
-          }
+          // A resource read has no isError flag, so the envelope travels as the error message.
           throw new McpError(
             ErrorCode.InternalError,
-            `Failed to load calendar accounts: ${error instanceof Error ? error.message : String(error)}`
+            envelopeTextFor(error, 'load the connected accounts')
           );
         }
       }
@@ -354,34 +358,35 @@ export class GoogleCalendarMcpServer {
 
     // For stdio mode, authentication should have been handled at startup
     if (this.config.transport.type === 'stdio') {
-      throw new McpError(
-        ErrorCode.InvalidRequest,
-        "Authentication tokens are no longer valid. Please restart the server to re-authenticate."
+      throw localEnvelopeError(
+        'no_credentials',
+        'The stored Google credentials are no longer valid.'
       );
     }
 
     // For HTTP mode, try to start auth server if not already running
     try {
       const authSuccess = await this.authServer.start(false); // openBrowser = false for HTTP mode
-      
+
       if (!authSuccess) {
-        throw new McpError(
-          ErrorCode.InvalidRequest,
-          "Authentication required. Please run 'npm run auth' to authenticate, or visit the auth URL shown in the logs for HTTP mode."
+        throw localEnvelopeError(
+          'no_credentials',
+          'No Google account is connected and the authentication server could not be started.'
         );
       }
     } catch (error) {
-      if (error instanceof McpError) {
+      if (isEnvelopeError(error)) {
         throw error;
       }
-      if (error instanceof Error) {
-        throw new McpError(ErrorCode.InvalidRequest, error.message);
-      }
-      throw new McpError(ErrorCode.InvalidRequest, "Authentication required. Please run 'npm run auth' to authenticate.");
+      throw localEnvelopeError(
+        'no_credentials',
+        'No Google account is connected and authentication could not be started.',
+        error instanceof Error ? error.message : String(error)
+      );
     }
   }
 
-  private async executeWithHandler(handler: any, args: any): Promise<{ content: Array<{ type: "text"; text: string }> }> {
+  private async executeWithHandler(handler: any, args: any): Promise<CallToolResult> {
     await this.ensureAuthenticated();
 
     // Circuit (docs/reqs/007): expand @@hN@@ handles in the args before the tool runs, and park a large result

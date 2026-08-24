@@ -78,7 +78,7 @@ describe('CreateEventHandler Blocking Logic', () => {
 
     // Now it should throw an error instead of returning a text message
     await expect(handler.runTool(args, mockAccounts)).rejects.toThrow(
-      'Duplicate event detected (100% similar). Event "Lunch with Josh" already exists. To create anyway, set allowDuplicates to true.'
+      '[duplicate_event] The event was not created because "Lunch with Josh" already exists and is 100% similar.'
     );
   });
 

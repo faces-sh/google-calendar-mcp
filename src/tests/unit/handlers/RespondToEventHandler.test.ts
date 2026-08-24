@@ -252,7 +252,7 @@ describe('RespondToEventHandler', () => {
       };
 
       await expect(handler.runTool(args, mockAccounts)).rejects.toThrow(
-        'You are not an attendee of this event. Only attendees can respond to event invitations.'
+        '[not_an_attendee]'
       );
     });
 
@@ -277,7 +277,7 @@ describe('RespondToEventHandler', () => {
       };
 
       await expect(handler.runTool(args, mockAccounts)).rejects.toThrow(
-        'You are the organizer of this event. Organizers do not respond to their own event invitations.'
+        '[is_organizer]'
       );
     });
 
@@ -290,7 +290,7 @@ describe('RespondToEventHandler', () => {
         response: 'accepted' as const
       };
 
-      await expect(handler.runTool(args, mockAccounts)).rejects.toThrow('Event not found');
+      await expect(handler.runTool(args, mockAccounts)).rejects.toThrow('[unexpected_response] Google returned no event for id');
     });
 
     it('should throw error when event has no attendees', async () => {
@@ -311,7 +311,7 @@ describe('RespondToEventHandler', () => {
       };
 
       await expect(handler.runTool(args, mockAccounts)).rejects.toThrow(
-        'You are not an attendee of this event. Only attendees can respond to event invitations.'
+        '[not_an_attendee]'
       );
     });
 
@@ -334,7 +334,7 @@ describe('RespondToEventHandler', () => {
       };
 
       await expect(handler.runTool(args, mockAccounts)).rejects.toThrow(
-        'Failed to update event response'
+        '[unexpected_response] Google accepted the response but returned nothing.'
       );
     });
 

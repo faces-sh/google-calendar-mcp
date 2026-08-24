@@ -6,6 +6,7 @@ import { calendar_v3 } from 'googleapis';
 import { buildListFieldMask } from "../../utils/field-mask-builder.js";
 import { createStructuredResponse } from "../../utils/response-builder.js";
 import { SearchEventsResponse, StructuredEvent, convertGoogleEventToStructured, ExtendedEvent } from "../../types/structured-responses.js";
+import { envelopeTextFor } from "../../utils/failure-envelope.js";
 
 // Internal args type for searchEvents with single calendarId (after normalization)
 interface SearchEventsArgs {
@@ -62,6 +63,7 @@ export class SearchEventsHandler extends BaseToolHandler {
         // Search events from all calendars across all accounts
         const allEvents: ExtendedEvent[] = [];
         const queriedCalendarIds: string[] = [];
+        const failures: unknown[] = [];
 
         await Promise.all(
             Array.from(accountCalendarMap.entries()).map(async ([accountId, calendarIds]) => {
@@ -82,10 +84,13 @@ export class SearchEventsHandler extends BaseToolHandler {
                         }
                         queriedCalendarIds.push(calendarId);
                     } catch (error) {
-                        // For multi-calendar, log but continue
+                        // For multi-calendar, record the failure and continue
                         if (accountCalendarMap.size > 1 || calendarIds.length > 1) {
-                            const message = error instanceof Error ? error.message : String(error);
-                            resolutionWarnings.push(`Failed to search calendar "${calendarId}" on account "${accountId}": ${message}`);
+                            failures.push(error);
+                            resolutionWarnings.push(
+                                `Calendar "${calendarId}" on account "${accountId}" could not be searched: ` +
+                                envelopeTextFor(error, `search calendar "${calendarId}"`)
+                            );
                         } else {
                             throw error;
                         }
@@ -93,6 +98,11 @@ export class SearchEventsHandler extends BaseToolHandler {
                 }
             })
         );
+
+        // No calendar could be searched at all: "no matches" would be a lie (rule 6).
+        if (queriedCalendarIds.length === 0 && failures.length > 0) {
+            throw this.toEnvelopeError(failures[0], 'search the events');
+        }
 
         // Sort events chronologically
         this.sortEventsByStartTime(allEvents);
@@ -157,7 +167,7 @@ export class SearchEventsHandler extends BaseToolHandler {
             });
             return response.data.items || [];
         } catch (error) {
-            throw this.handleGoogleApiError(error);
+            throw this.handleGoogleApiError(error, `search calendar "${args.calendarId}"`);
         }
     }
 

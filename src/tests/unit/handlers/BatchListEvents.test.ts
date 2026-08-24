@@ -46,6 +46,9 @@ describe('Batch List Events Functionality', () => {
         list: vi.fn()
       },
       calendarList: {
+        // getCalendarTimezone reads this. It used to be missing and nobody noticed, because a
+        // failure here was silently turned into 'UTC'.
+        get: vi.fn().mockResolvedValue({ data: { id: 'primary', timeZone: 'UTC' } }),
         list: vi.fn().mockResolvedValue({
           data: {
             items: [

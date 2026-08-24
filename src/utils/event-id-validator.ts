@@ -1,3 +1,5 @@
+import { localEnvelopeError } from "./failure-envelope.js";
+
 /**
  * Event ID validation utility for Google Calendar API
  */
@@ -59,7 +61,11 @@ export function validateEventId(eventId: string): void {
       errors.push("can only contain lowercase letters a-v and digits 0-9 (base32hex encoding)");
     }
     
-    throw new Error(`Invalid event ID: ${errors.join(", ")}`);
+    throw localEnvelopeError(
+      'bad_request',
+      'The event id given is not a valid Google Calendar event id.',
+      `Invalid event ID: ${errors.join(", ")}`
+    );
   }
 }
 

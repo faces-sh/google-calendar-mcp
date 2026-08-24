@@ -163,7 +163,7 @@ describe('FreeBusyEventHandler', () => {
       };
 
       await expect(handler.runTool(args, mockAccounts)).rejects.toThrow(
-        'The time gap between timeMin and timeMax must be less than 3 months'
+        '[bad_request] The requested time range is longer than the three months Google allows for a free/busy query.'
       );
     });
 
@@ -342,9 +342,11 @@ describe('FreeBusyEventHandler', () => {
       expect(response.calendars['invalid@calendar.com'].errors[0].reason).toBe('notFound');
     });
 
-    it('should handle API errors by returning error in response', async () => {
-      // With multi-account support, API errors are caught and logged per-account
-      // If all accounts fail, the calendar will show as notFound in the response
+    it('surfaces the failure instead of reporting the calendar as free', async () => {
+      // This used to come back as a SUCCESS with busy: [] and reason 'notFound'. "You have
+      // nothing on Friday" and "I could not read your calendar" are opposite answers, so the
+      // failure is now raised with its status line and Google's body
+      // (docs/MCP_FAILURE_ENVELOPE.md rule 6).
       const apiError = new Error('Bad Request');
       (apiError as any).code = 400;
       mockCalendar.freebusy.query.mockRejectedValue(apiError);
@@ -355,14 +357,7 @@ describe('FreeBusyEventHandler', () => {
         calendars: [{ id: 'primary' }]
       };
 
-      // The handler now catches errors per-account and returns notFound for calendars
-      // that couldn't be queried from any account
-      const result = await handler.runTool(args, mockAccounts);
-      const response = JSON.parse(result.content[0].text);
-
-      // Calendar should show as notFound since the query failed
-      expect(response.calendars['primary'].errors).toBeDefined();
-      expect(response.calendars['primary'].errors[0].reason).toBe('notFound');
+      await expect(handler.runTool(args, mockAccounts)).rejects.toThrow('[http_400]');
     });
   });
 

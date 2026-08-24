@@ -253,7 +253,7 @@ HTTP/1.1 200 OK
       };
 
       await expect(handler.runTool(args, mockAccounts)).rejects.toThrow(
-        /Calendar\(s\) not found: "NonExistentCalendar"/
+        /\[calendar_not_found\] This account has no calendar called "NonExistentCalendar"/
       );
 
       try {
@@ -396,7 +396,7 @@ HTTP/1.1 200 OK
       };
 
       await expect(handler.runTool(args, mockAccounts)).rejects.toThrow(
-        /At least one valid calendar identifier is required/
+        /\[bad_request\] No calendar was named in the request/
       );
     });
   });

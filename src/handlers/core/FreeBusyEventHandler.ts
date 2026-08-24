@@ -5,8 +5,8 @@ import { GetFreeBusyInput } from "../../tools/registry.js";
 import { FreeBusyResponse as GoogleFreeBusyResponse } from '../../schemas/types.js';
 import { FreeBusyResponse, BusySlot } from '../../types/structured-responses.js';
 import { createStructuredResponse } from '../../utils/response-builder.js';
-import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js';
 import { convertToRFC3339 } from '../../utils/datetime.js';
+import { envelopeTextFor, localEnvelopeError } from '../../utils/failure-envelope.js';
 
 interface FreeBusyCalendarResult {
   busy: BusySlot[];
@@ -18,9 +18,10 @@ export class FreeBusyEventHandler extends BaseToolHandler {
     const validArgs = args as GetFreeBusyInput;
 
     if (!this.isLessThanThreeMonths(validArgs.timeMin, validArgs.timeMax)) {
-      throw new McpError(
-        ErrorCode.InvalidRequest,
-        "The time gap between timeMin and timeMax must be less than 3 months"
+      throw localEnvelopeError(
+        'bad_request',
+        'The requested time range is longer than the three months Google allows for a free/busy query.',
+        `timeMin: ${validArgs.timeMin}, timeMax: ${validArgs.timeMax}`
       );
     }
 
@@ -28,12 +29,13 @@ export class FreeBusyEventHandler extends BaseToolHandler {
     const selectedAccounts = this.getClientsForAccounts(args.account, accounts);
 
     // Query freebusy from all selected accounts and merge results
-    const mergedCalendars = await this.queryFreeBusyMultiAccount(selectedAccounts, validArgs);
+    const { calendars: mergedCalendars, warnings } = await this.queryFreeBusyMultiAccount(selectedAccounts, validArgs);
 
     const response: FreeBusyResponse = {
       timeMin: validArgs.timeMin,
       timeMax: validArgs.timeMax,
-      calendars: mergedCalendars
+      calendars: mergedCalendars,
+      ...(warnings.length > 0 && { warnings })
     };
 
     return createStructuredResponse(response);
@@ -42,9 +44,11 @@ export class FreeBusyEventHandler extends BaseToolHandler {
   private async queryFreeBusyMultiAccount(
     accounts: Map<string, OAuth2Client>,
     args: GetFreeBusyInput
-  ): Promise<Record<string, FreeBusyCalendarResult>> {
+  ): Promise<{ calendars: Record<string, FreeBusyCalendarResult>; warnings: string[] }> {
     const mergedCalendars: Record<string, FreeBusyCalendarResult> = {};
     const calendarIds = args.calendars.map(c => c.id);
+    // Named apart from the registry's resolution warnings, which are destructured below.
+    const failureWarnings: string[] = [];
 
     // For multi-account queries, pre-resolve which calendars exist on which accounts
     // This prevents the "cartesian product" problem where we try to query all calendars
@@ -60,15 +64,17 @@ export class FreeBusyEventHandler extends BaseToolHandler {
       accountCalendarMap = resolved;
       resolutionWarnings.push(...warnings);
 
-      // If no calendars could be resolved, mark all as not found
+      // If no calendars could be resolved, mark all as not found. An account we could not read
+      // at all is a failure, not an absence, so that is raised instead.
       if (accountCalendarMap.size === 0) {
+        this.throwCalendarAccessFailureIfAny('read the free/busy information');
         for (const calId of calendarIds) {
           mergedCalendars[calId] = {
             busy: [],
             errors: [{ reason: 'notFound' }]
           };
         }
-        return mergedCalendars;
+        return { calendars: mergedCalendars, warnings: [...resolutionWarnings] };
       }
     } else {
       // Single account: send all calendars to that account
@@ -89,13 +95,42 @@ export class FreeBusyEventHandler extends BaseToolHandler {
           const result = await this.queryFreeBusy(client, filteredArgs);
           return { accountId, result, error: null, calendarsQueried: calendarsForAccount };
         } catch (error) {
-          // Log but don't fail - other accounts might succeed
-          const message = error instanceof Error ? error.message : String(error);
-          process.stderr.write(`Warning: FreeBusy query failed for account "${accountId}": ${message}\n`);
-          return { accountId, result: null, error: message, calendarsQueried: calendarsForAccount };
+          // Do not fail the whole query: other accounts might succeed. But the failure is
+          // REPORTED, never written to stderr and forgotten. An empty busy list that means "the
+          // query failed" and one that means "nothing is scheduled" are opposite answers.
+          return { accountId, result: null, error, calendarsQueried: calendarsForAccount };
         }
       })
     );
+
+    const failed = results.filter(r => r.error !== null);
+
+    // Every account failed: there is nothing to report but the failure.
+    if (failed.length > 0 && failed.length === results.length) {
+      throw this.toEnvelopeError(failed[0].error, 'read the free/busy information');
+    }
+
+    for (const failure of failed) {
+      failureWarnings.push(
+        `Account "${failure.accountId}" could not be queried, so its calendars ` +
+        `(${failure.calendarsQueried.join(', ')}) are missing from this answer: ` +
+        envelopeTextFor(failure.error, `read free/busy for account "${failure.accountId}"`)
+      );
+    }
+
+    // Calendars that were only routed to an account that failed: their result is unknown, and
+    // "unknown" must not be rendered as "notFound" or as an empty busy list.
+    const unqueriedCalendars = new Set<string>();
+    for (const failure of failed) {
+      for (const calId of failure.calendarsQueried) {
+        unqueriedCalendars.add(calId);
+      }
+    }
+    for (const success of results.filter(r => r.error === null)) {
+      for (const calId of success.calendarsQueried) {
+        unqueriedCalendars.delete(calId);
+      }
+    }
 
     // Merge results from all accounts
     // For each calendar, prefer results without errors
@@ -122,18 +157,20 @@ export class FreeBusyEventHandler extends BaseToolHandler {
         }
       }
 
-      // If no account returned data for this calendar, mark it as not found
+      // If no account returned data for this calendar, say why: a calendar whose only account
+      // failed was never queried, and calling that 'notFound' invents an answer.
       if (!bestResult) {
         mergedCalendars[calId] = {
           busy: [],
-          errors: [{ reason: 'notFound' }]
+          errors: [{ reason: unqueriedCalendars.has(calId) ? 'queryFailed' : 'notFound' }]
         };
       } else {
         mergedCalendars[calId] = bestResult;
       }
     }
 
-    return mergedCalendars;
+    // resolutionWarnings used to be collected here and then dropped on the floor.
+    return { calendars: mergedCalendars, warnings: [...resolutionWarnings, ...failureWarnings] };
   }
 
   private async queryFreeBusy(
@@ -145,9 +182,8 @@ export class FreeBusyEventHandler extends BaseToolHandler {
 
       // Determine timezone with correct precedence:
       // 1. Explicit timeZone parameter (highest priority)
-      // 2. Primary calendar's default timezone (fallback)
-      // 3. UTC if calendar timezone retrieval fails
-      // getCalendarTimezone already falls back to UTC on failure
+      // 2. Primary calendar's default timezone
+      // 3. UTC when the calendar has no timezone set or is not in this account's list
       const timezone = args.timeZone || await this.getCalendarTimezone(client, 'primary');
 
       // Convert time boundaries to RFC3339 format for Google Calendar API
@@ -179,7 +215,7 @@ export class FreeBusyEventHandler extends BaseToolHandler {
       });
       return response.data as GoogleFreeBusyResponse;
     } catch (error) {
-      throw this.handleGoogleApiError(error);
+      throw this.handleGoogleApiError(error, 'read the free/busy information');
     }
   }
 

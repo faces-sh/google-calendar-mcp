@@ -5,9 +5,9 @@
 //   wrapResult(result) on return (park a large result + PREPEND its slug so the next tool can wire it).
 // No-op when the circuit env is absent (server run outside Maestro), so the server still works solo.
 
-const THRESHOLD = 200;
+import { localEnvelopeError } from "./utils/failure-envelope.js";
 
-export class CircuitError extends Error {}
+const THRESHOLD = 200;
 
 function cfg(): { url: string; secret: string; session: string } | null {
   const url = (process.env.MAESTRO_CIRCUIT_URL || "").trim();
@@ -28,7 +28,10 @@ async function post(path: string, body: unknown, url: string, secret: string): P
 async function fetchSlug(slug: string, c: { url: string; secret: string; session: string }): Promise<string> {
   const { status, json } = await post("/get", { session: c.session, slug }, c.url, c.secret);
   if (status === 404) {
-    throw new CircuitError(`Unknown or expired circuit slug ${slug}; it is no longer cached, re-fetch it.`);
+    throw localEnvelopeError(
+      'circuit_slug_expired',
+      `The handle ${slug} could not be expanded because it is no longer cached.`
+    );
   }
   return (json && json.payload) || "";
 }
@@ -60,6 +63,9 @@ export async function resolveArgs(args: any): Promise<any> {
 export async function wrapResult(result: any): Promise<any> {
   const c = cfg();
   if (!c || !result || !Array.isArray(result.content)) return result;
+  // A failure envelope is never parked behind a handle: its text must begin with [<code>] and
+  // nothing may come before it (docs/MCP_FAILURE_ENVELOPE.md rule 2).
+  if (result.isError) return result;
   const first = result.content[0];
   if (!first || first.type !== "text" || typeof first.text !== "string" || first.text.length < THRESHOLD) {
     return result;

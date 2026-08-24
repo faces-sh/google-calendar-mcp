@@ -198,11 +198,6 @@ describe('CreateEventsHandler', () => {
         .mockRejectedValueOnce(new Error('API error for event 2'))
         .mockResolvedValueOnce({ data: makeMockEvent({ id: 'ok-3', summary: 'Also Good' }) });
 
-      // handleGoogleApiError converts raw errors to McpError
-      vi.spyOn(handler as any, 'handleGoogleApiError').mockImplementation((error: any) => {
-        throw new McpError(ErrorCode.InternalError, `Internal error: ${error.message}`);
-      });
-
       const args = {
         events: [
           { summary: 'Good Event', start: '2025-06-15T09:00:00', end: '2025-06-15T10:00:00' },
@@ -226,13 +221,16 @@ describe('CreateEventsHandler', () => {
       expect(response.failed[0].error).toContain('API error for event 2');
     });
 
-    it('should use formatGoogleApiError to format error messages', async () => {
-      const formatSpy = vi.spyOn(handler as any, 'formatGoogleApiError').mockReturnValue('Bad Request: Invalid time range');
+    it('formats each per-event failure as its envelope', async () => {
+      const formatSpy = vi.spyOn(handler as any, 'formatGoogleApiError');
 
-      mockCalendar.events.insert.mockRejectedValueOnce(new Error('raw error'));
+      mockCalendar.events.insert
+        .mockResolvedValueOnce({ data: makeMockEvent({ id: 'ok-1', summary: 'Good Event' }) })
+        .mockRejectedValueOnce(new Error('raw error'));
 
       const args = {
         events: [
+          { summary: 'Good Event', start: '2025-06-15T09:00:00', end: '2025-06-15T10:00:00' },
           { summary: 'Bad Event', start: '2025-06-15T10:00:00', end: '2025-06-15T09:00:00' },
         ]
       };
@@ -241,16 +239,13 @@ describe('CreateEventsHandler', () => {
 
       expect(formatSpy).toHaveBeenCalled();
       const response = JSON.parse(result.content[0].text);
-      expect(response.failed[0].error).toContain('Bad Request: Invalid time range');
+      expect(response.failed[0].error).toContain('[internal_error] Could not create the event.');
+      expect(response.failed[0].error).toContain('raw error');
     });
   });
 
   describe('All-Failure', () => {
-    it('should set isError when all events fail', async () => {
-      vi.spyOn(handler as any, 'handleGoogleApiError').mockImplementation((error: any) => {
-        throw new McpError(ErrorCode.InternalError, `Internal error: ${error.message}`);
-      });
-
+    it('raises the failure envelope when all events fail', async () => {
       mockCalendar.events.insert
         .mockRejectedValueOnce(new Error('fail 1'))
         .mockRejectedValueOnce(new Error('fail 2'));
@@ -262,20 +257,12 @@ describe('CreateEventsHandler', () => {
         ]
       };
 
-      const result = await handler.runTool(args, mockAccounts);
-
-      expect(result.isError).toBe(true);
-      const response = JSON.parse(result.content[0].text);
-      expect(response.totalCreated).toBe(0);
-      expect(response.totalFailed).toBe(2);
-      expect(response.failed).toHaveLength(2);
+      await expect(handler.runTool(args, mockAccounts)).rejects.toThrow(
+        '[internal_error] Could not create any of the 2 requested events.'
+      );
     });
 
-    it('should set isError when a single event fails', async () => {
-      vi.spyOn(handler as any, 'handleGoogleApiError').mockImplementation((error: any) => {
-        throw new McpError(ErrorCode.InternalError, `Internal error: ${error.message}`);
-      });
-
+    it('raises the failure envelope when the only event fails', async () => {
       mockCalendar.events.insert.mockRejectedValueOnce(new Error('fail'));
 
       const args = {
@@ -284,12 +271,9 @@ describe('CreateEventsHandler', () => {
         ]
       };
 
-      const result = await handler.runTool(args, mockAccounts);
-
-      expect(result.isError).toBe(true);
-      const response = JSON.parse(result.content[0].text);
-      expect(response.totalCreated).toBe(0);
-      expect(response.totalFailed).toBe(1);
+      await expect(handler.runTool(args, mockAccounts)).rejects.toThrow(
+        '[internal_error] Could not create the requested event.'
+      );
     });
 
     it('should throw when pre-validation of shared account fails', async () => {
@@ -491,10 +475,6 @@ describe('CreateEventsHandler', () => {
 
   describe('Circuit Breaker', () => {
     it('should skip remaining events after 3 consecutive identical failures', async () => {
-      vi.spyOn(handler as any, 'handleGoogleApiError').mockImplementation(() => {
-        throw new McpError(ErrorCode.InvalidRequest, 'Access denied: Insufficient permissions');
-      });
-
       mockCalendar.events.insert.mockRejectedValue(new Error('Forbidden'));
 
       const args = {
@@ -507,22 +487,13 @@ describe('CreateEventsHandler', () => {
         ]
       };
 
-      const result = await handler.runTool(args, mockAccounts);
+      await expect(handler.runTool(args, mockAccounts)).rejects.toThrow('[internal_error]');
 
-      const response = JSON.parse(result.content[0].text);
-      expect(response.totalFailed).toBe(5);
       // Only 3 API calls should have been made (circuit breaker trips after 3rd)
       expect(mockCalendar.events.insert).toHaveBeenCalledTimes(3);
-      // Events 4 and 5 should be marked as skipped
-      expect(response.failed[3].error).toContain('Skipped');
-      expect(response.failed[4].error).toContain('Skipped');
     });
 
     it('should reset circuit breaker on success', async () => {
-      vi.spyOn(handler as any, 'handleGoogleApiError').mockImplementation((error: any) => {
-        throw new McpError(ErrorCode.InternalError, `Internal error: ${error.message}`);
-      });
-
       // Fail twice, succeed, fail twice more - should NOT trigger circuit breaker
       mockCalendar.events.insert
         .mockRejectedValueOnce(new Error('same error'))
@@ -551,10 +522,6 @@ describe('CreateEventsHandler', () => {
     });
 
     it('should not trigger circuit breaker for different error messages', async () => {
-      vi.spyOn(handler as any, 'handleGoogleApiError').mockImplementation((error: any) => {
-        throw new McpError(ErrorCode.InternalError, error.message);
-      });
-
       mockCalendar.events.insert
         .mockRejectedValueOnce(new Error('Error A'))
         .mockRejectedValueOnce(new Error('Error B'))
@@ -570,12 +537,10 @@ describe('CreateEventsHandler', () => {
         ]
       };
 
-      const result = await handler.runTool(args, mockAccounts);
+      await expect(handler.runTool(args, mockAccounts)).rejects.toThrow('[internal_error]');
 
       // All 4 calls should proceed since errors are different
       expect(mockCalendar.events.insert).toHaveBeenCalledTimes(4);
-      const response = JSON.parse(result.content[0].text);
-      expect(response.totalFailed).toBe(4);
     });
   });
 
@@ -674,10 +639,6 @@ describe('CreateEventsHandler', () => {
     });
 
     it('should handle event with no data returned from API', async () => {
-      vi.spyOn(handler as any, 'handleGoogleApiError').mockImplementation((error: any) => {
-        throw new McpError(ErrorCode.InternalError, `Internal error: ${error.message}`);
-      });
-
       mockCalendar.events.insert.mockResolvedValue({ data: null });
 
       const args = {
@@ -686,12 +647,9 @@ describe('CreateEventsHandler', () => {
         ]
       };
 
-      const result = await handler.runTool(args, mockAccounts);
-
-      expect(result.isError).toBe(true);
-      const response = JSON.parse(result.content[0].text);
-      expect(response.totalFailed).toBe(1);
-      expect(response.failed[0].error).toContain('Failed to create event');
+      await expect(handler.runTool(args, mockAccounts)).rejects.toThrow(
+        '[unexpected_response] Google accepted the event but returned nothing.'
+      );
     });
 
     it('should use calendar timezone fallback when no timezone provided', async () => {

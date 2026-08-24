@@ -59,17 +59,17 @@ describe('BaseToolHandler - Multi-Account Support', () => {
 
     it('should throw error when no account specified and multiple accounts exist', () => {
       expect(() => handler.getClientForAccount(undefined, accounts))
-        .toThrow(/must specify.*account.*parameter/i);
+        .toThrow(/\[account_required\]/);
     });
 
     it('should throw error when no accounts available', () => {
       expect(() => handler.getClientForAccount(undefined, new Map()))
-        .toThrow(/no authenticated accounts/i);
+        .toThrow(/\[no_credentials\]/);
     });
 
     it('should throw error when specified account does not exist', () => {
       expect(() => handler.getClientForAccount('nonexistent', accounts))
-        .toThrow(/account.*nonexistent.*not found/i);
+        .toThrow(/\[account_not_found\] There is no connected account called "nonexistent"/);
     });
 
     it('should validate account ID format', () => {
@@ -102,7 +102,7 @@ describe('BaseToolHandler - Multi-Account Support', () => {
     it('should fail when no account specified with multiple accounts', async () => {
       await expect(
         handler.runTool({ testParam: 'test' }, accounts)
-      ).rejects.toThrow(/must specify.*account/i);
+      ).rejects.toThrow(/\[account_required\]/);
     });
   });
 

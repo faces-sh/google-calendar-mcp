@@ -1,4 +1,5 @@
 import { OAuth2Client } from "google-auth-library";
+import { EnvelopeError, localEnvelopeError, statusLineFor } from "../../utils/failure-envelope.js";
 
 export interface BatchRequest {
   method: string;
@@ -21,13 +22,24 @@ export interface BatchError {
   details?: any;
 }
 
-export class BatchRequestError extends Error {
+/**
+ * A failed batch call, carrying the uniform failure envelope (docs/MCP_FAILURE_ENVELOPE.md): the
+ * literal status line and Google's response body, verbatim and redacted of credentials.
+ */
+export class BatchRequestError extends EnvelopeError {
   constructor(
-    message: string,
+    summary: string,
     public errors: BatchError[],
-    public partial: boolean = false
+    public partial: boolean = false,
+    envelope?: { code: string; statusLine?: string; body?: string; status?: number }
   ) {
-    super(message);
+    super({
+      code: envelope?.code ?? 'batch_failed',
+      summary,
+      statusLine: envelope?.statusLine,
+      body: envelope?.body,
+      status: envelope?.status
+    });
     this.name = 'BatchRequestError';
   }
 }
@@ -48,7 +60,10 @@ export class BatchRequestHandler {
     }
 
     if (requests.length > 50) {
-      throw new Error('Batch requests cannot exceed 50 requests per batch');
+      throw localEnvelopeError(
+        'bad_request',
+        `A batch may hold at most 50 requests, and ${requests.length} were given.`
+      );
     }
 
     return this.executeBatchWithRetry(requests, 0);
@@ -82,12 +97,19 @@ export class BatchRequestHandler {
 
       if (!response.ok) {
         throw new BatchRequestError(
-          `Batch request failed: ${response.status} ${response.statusText}`,
+          'Could not read the calendars: the batch request was refused.',
           [{
             statusCode: response.status,
-            message: `HTTP ${response.status}: ${response.statusText}`,
+            message: statusLineFor(response.status, response.statusText),
             details: responseText
-          }]
+          }],
+          false,
+          {
+            code: `http_${response.status}`,
+            statusLine: statusLineFor(response.status, response.statusText),
+            body: responseText,
+            status: response.status
+          }
         );
       }
 
@@ -105,14 +127,19 @@ export class BatchRequestHandler {
         return this.executeBatchWithRetry(requests, attempt + 1);
       }
       
-      // Handle network or auth errors
+      // Handle network or auth errors. There is no HTTP response, so no status line is invented
+      // (docs/MCP_FAILURE_ENVELOPE.md rule 4), and the raw error object is NOT echoed: it can
+      // carry the request headers, and those carry the bearer token.
+      const detail = error instanceof Error ? error.message : String(error);
       throw new BatchRequestError(
-        `Failed to execute batch request: ${error instanceof Error ? error.message : 'Unknown error'}`,
+        'Could not read the calendars: the batch request did not complete.',
         [{
           statusCode: 0,
-          message: error instanceof Error ? error.message : 'Unknown error',
-          details: error
-        }]
+          message: detail,
+          details: detail
+        }],
+        false,
+        { code: 'network_error', body: detail }
       );
     }
   }
@@ -185,7 +212,11 @@ export class BatchRequestHandler {
     }
     
     if (!boundary) {
-      throw new Error('Could not find boundary in batch response');
+      throw localEnvelopeError(
+        'unexpected_response',
+        'Google returned a batch response that could not be read.',
+        responseText
+      );
     }
     
     // Split by boundary markers

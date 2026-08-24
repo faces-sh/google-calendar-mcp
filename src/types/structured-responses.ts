@@ -396,6 +396,12 @@ export interface FreeBusyResponse {
       reason?: string;
     }>;
   }>;
+  /**
+   * Accounts that could not be queried. A busy list that is empty because the query failed is not
+   * the same as a calendar with nothing on it, and the difference is stated here rather than
+   * swallowed (docs/MCP_FAILURE_ENVELOPE.md rule 6).
+   */
+  warnings?: string[];
 }
 
 /**

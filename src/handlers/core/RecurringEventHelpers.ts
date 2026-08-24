@@ -1,5 +1,6 @@
 import { calendar_v3 } from 'googleapis';
 import { createTimeObject } from '../../utils/datetime.js';
+import { EnvelopeError, localEnvelopeError } from '../../utils/failure-envelope.js';
 
 export class RecurringEventHelpers {
   private calendar: calendar_v3.Calendar;
@@ -68,7 +69,7 @@ export class RecurringEventHelpers {
    */
   updateRecurrenceWithUntil(recurrence: string[], untilDate: string): string[] {
     if (!recurrence || recurrence.length === 0) {
-      throw new Error('No recurrence rule found');
+      throw localEnvelopeError('not_recurring', 'The event has no recurrence rule to change.');
     }
 
     const updatedRecurrence: string[] = [];
@@ -89,7 +90,7 @@ export class RecurringEventHelpers {
     }
 
     if (!foundRRule) {
-      throw new Error('No RRULE found in recurrence rules');
+      throw localEnvelopeError('not_recurring', 'The event has no RRULE in its recurrence rules.');
     }
 
     return updatedRecurrence;
@@ -169,13 +170,17 @@ export class RecurringEventHelpers {
 }
 
 /**
- * Custom error class for recurring event errors
+ * Custom error class for recurring event errors.
+ *
+ * It carries the uniform failure envelope (docs/MCP_FAILURE_ENVELOPE.md): the message IS the
+ * envelope text, so `[missing_original_start_time] ...` reaches the caller whichever layer ends up
+ * printing it. There is no status line, because none of these failures are HTTP.
  */
-export class RecurringEventError extends Error {
+export class RecurringEventError extends EnvelopeError {
   public code: string;
 
   constructor(message: string, code: string) {
-    super(message);
+    super({ code: code.toLowerCase(), summary: message });
     this.name = 'RecurringEventError';
     this.code = code;
   }

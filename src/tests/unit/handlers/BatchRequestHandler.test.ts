@@ -365,7 +365,7 @@ Content-Type: application/json
       ];
 
       await expect(noRetryHandler.executeBatch(requests))
-        .rejects.toThrow('Failed to execute batch request: Network error');
+        .rejects.toThrow('[network_error] Could not read the calendars: the batch request did not complete.');
     });
 
     it('should handle authentication errors', async () => {

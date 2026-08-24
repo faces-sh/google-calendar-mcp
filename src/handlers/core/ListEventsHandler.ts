@@ -6,6 +6,17 @@ import { BatchRequestHandler } from "./BatchRequestHandler.js";
 import { buildListFieldMask } from "../../utils/field-mask-builder.js";
 import { createStructuredResponse } from "../../utils/response-builder.js";
 import { ListEventsResponse, StructuredEvent, convertGoogleEventToStructured, ExtendedEvent } from "../../types/structured-responses.js";
+import { envelopeTextFor, httpEnvelopeError } from "../../utils/failure-envelope.js";
+
+interface CalendarFailure {
+  calendarId: string;
+  error: unknown;
+}
+
+interface CalendarFetchResult {
+  events: ExtendedEvent[];
+  failures: CalendarFailure[];
+}
 
 interface ListEventsArgs {
   calendarId: string | string[];
@@ -55,6 +66,8 @@ export class ListEventsHandler extends BaseToolHandler {
         }
 
         // Fetch events from accounts that have matching calendars
+        const failures: unknown[] = [];
+        let succeededCalendars = 0;
         const eventsPerAccount = await Promise.all(
             Array.from(accountCalendarMap.entries()).map(async ([accountId, calendarsForAccount]) => {
                 const client = selectedAccounts.get(accountId)!;
@@ -65,7 +78,7 @@ export class ListEventsHandler extends BaseToolHandler {
                         ? await this.resolveCalendarIds(client, calendarsForAccount)
                         : calendarsForAccount;
 
-                    const events = await this.fetchEvents(client, calendarIds, {
+                    const { events, failures: calendarFailures } = await this.fetchEvents(client, calendarIds, {
                         timeMin: args.timeMin,
                         timeMax: args.timeMax,
                         timeZone: args.timeZone,
@@ -73,6 +86,17 @@ export class ListEventsHandler extends BaseToolHandler {
                         privateExtendedProperty: args.privateExtendedProperty,
                         sharedExtendedProperty: args.sharedExtendedProperty
                     });
+
+                    // A calendar that failed inside a batch used to be written to stderr and
+                    // dropped, so a 403 on every calendar came back as "no events" (rule 6).
+                    succeededCalendars += calendarIds.length - calendarFailures.length;
+                    for (const failure of calendarFailures) {
+                        failures.push(failure.error);
+                        partialFailures.push({
+                            accountId,
+                            reason: `calendar "${failure.calendarId}": ${envelopeTextFor(failure.error, `list events in calendar "${failure.calendarId}"`)}`
+                        });
+                    }
 
                     // Tag events with account ID and return metadata
                     return {
@@ -85,17 +109,22 @@ export class ListEventsHandler extends BaseToolHandler {
                     if (selectedAccounts.size === 1) {
                         throw error;
                     }
-                    const reason = error instanceof Error ? error.message : String(error);
+                    failures.push(error);
                     partialFailures.push({
                         accountId,
-                        reason
+                        reason: envelopeTextFor(error, `list events for account "${accountId}"`)
                     });
-                    process.stderr.write(`Warning: Failed to load events for account "${accountId}": ${reason}\n`);
                     // For multi-account, continue with other accounts
                     return { accountId, calendarIds: [], events: [] };
                 }
             })
         );
+
+        // Nothing at all could be read: that is a failure, not an empty calendar. "You have
+        // nothing on Friday" and "I could not read your calendar" are opposite answers.
+        if (succeededCalendars === 0 && failures.length > 0) {
+            throw this.toEnvelopeError(failures[0], 'list the events');
+        }
 
         // Flatten and merge all events and calendar IDs
         const allEvents = eventsPerAccount.flatMap(result => result.events);
@@ -145,11 +174,12 @@ export class ListEventsHandler extends BaseToolHandler {
         client: OAuth2Client,
         calendarIds: string[],
         options: { timeMin?: string; timeMax?: string; timeZone?: string; fields?: string[]; privateExtendedProperty?: string[]; sharedExtendedProperty?: string[] }
-    ): Promise<ExtendedEvent[]> {
+    ): Promise<CalendarFetchResult> {
         if (calendarIds.length === 1) {
-            return this.fetchSingleCalendarEvents(client, calendarIds[0], options);
+            const events = await this.fetchSingleCalendarEvents(client, calendarIds[0], options);
+            return { events, failures: [] };
         }
-        
+
         return this.fetchMultipleCalendarEvents(client, calendarIds, options);
     }
 
@@ -185,7 +215,7 @@ export class ListEventsHandler extends BaseToolHandler {
                 calendarId
             }));
         } catch (error) {
-            throw this.handleGoogleApiError(error);
+            throw this.handleGoogleApiError(error, `list events in calendar "${calendarId}"`);
         }
     }
 
@@ -193,23 +223,19 @@ export class ListEventsHandler extends BaseToolHandler {
         client: OAuth2Client,
         calendarIds: string[],
         options: { timeMin?: string; timeMax?: string; timeZone?: string; fields?: string[]; privateExtendedProperty?: string[]; sharedExtendedProperty?: string[] }
-    ): Promise<ExtendedEvent[]> {
+    ): Promise<CalendarFetchResult> {
         const batchHandler = new BatchRequestHandler(client);
-        
+
         const requests = await Promise.all(calendarIds.map(async (calendarId) => ({
             method: "GET" as const,
             path: await this.buildEventsPath(client, calendarId, options)
         })));
-        
+
         const responses = await batchHandler.executeBatch(requests);
-        
-        const { events, errors } = this.processBatchResponses(responses, calendarIds);
-        
-        if (errors.length > 0) {
-            process.stderr.write(`Some calendars had errors: ${errors.map(e => `${e.calendarId}: ${e.error}`).join(', ')}\n`);
-        }
-        
-        return this.sortEventsByStartTime(events);
+
+        const { events, failures } = this.processBatchResponses(responses, calendarIds);
+
+        return { events: this.sortEventsByStartTime(events), failures };
     }
 
     private async buildEventsPath(client: OAuth2Client, calendarId: string, options: { timeMin?: string; timeMax?: string; timeZone?: string; fields?: string[]; privateExtendedProperty?: string[]; sharedExtendedProperty?: string[] }): Promise<string> {
@@ -238,15 +264,15 @@ export class ListEventsHandler extends BaseToolHandler {
     }
 
     private processBatchResponses(
-        responses: any[], 
+        responses: any[],
         calendarIds: string[]
-    ): { events: ExtendedEvent[]; errors: Array<{ calendarId: string; error: string }> } {
+    ): CalendarFetchResult {
         const events: ExtendedEvent[] = [];
-        const errors: Array<{ calendarId: string; error: string }> = [];
-        
+        const failures: CalendarFailure[] = [];
+
         responses.forEach((response, index) => {
             const calendarId = calendarIds[index];
-            
+
             if (response.statusCode === 200 && response.body?.items) {
                 const calendarEvents: ExtendedEvent[] = response.body.items.map((event: any) => ({
                     ...event,
@@ -254,13 +280,19 @@ export class ListEventsHandler extends BaseToolHandler {
                 }));
                 events.push(...calendarEvents);
             } else {
-                const errorMessage = response.body?.error?.message || 
-                                   response.body?.message || 
-                                   `HTTP ${response.statusCode}`;
-                errors.push({ calendarId, error: errorMessage });
+                // Keep Google's own body for this sub-request, verbatim, so the caller can tell an
+                // expired credential from a permission the account never had.
+                failures.push({
+                    calendarId,
+                    error: httpEnvelopeError({
+                        action: `list events in calendar "${calendarId}"`,
+                        status: response.statusCode,
+                        body: response.body
+                    })
+                });
             }
         });
-        
-        return { events, errors };
+
+        return { events, failures };
     }
 }

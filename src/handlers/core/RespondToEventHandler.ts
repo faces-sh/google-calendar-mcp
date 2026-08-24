@@ -5,6 +5,7 @@ import { calendar_v3 } from 'googleapis';
 import { createStructuredResponse } from "../../utils/response-builder.js";
 import { RespondToEventResponse, convertGoogleEventToStructured } from "../../types/structured-responses.js";
 import { RecurringEventHelpers, RecurringEventError, RECURRING_EVENT_ERRORS } from './RecurringEventHelpers.js';
+import { isEnvelopeError, localEnvelopeError } from "../../utils/failure-envelope.js";
 
 export type RespondToEventInput = {
     calendarId: string;
@@ -67,7 +68,10 @@ export class RespondToEventHandler extends BaseToolHandler {
 
             const event = eventResponse.data;
             if (!event) {
-                throw new Error('Event not found');
+                throw localEnvelopeError(
+                    'unexpected_response',
+                    `Google returned no event for id "${targetEventId}".`
+                );
             }
 
             // 3. Find the authenticated user's attendee entry (marked with self: true)
@@ -75,8 +79,9 @@ export class RespondToEventHandler extends BaseToolHandler {
             const selfAttendeeIndex = attendees.findIndex(a => a.self === true);
 
             if (selfAttendeeIndex === -1) {
-                throw new Error(
-                    'You are not an attendee of this event. Only attendees can respond to event invitations.'
+                throw localEnvelopeError(
+                    'not_an_attendee',
+                    'The response was not recorded because this account is not an attendee of the event.'
                 );
             }
 
@@ -84,8 +89,9 @@ export class RespondToEventHandler extends BaseToolHandler {
 
             // 4. Check if user is the organizer (organizers don't respond to their own events)
             if (selfAttendee.organizer === true) {
-                throw new Error(
-                    'You are the organizer of this event. Organizers do not respond to their own event invitations.'
+                throw localEnvelopeError(
+                    'is_organizer',
+                    'The response was not recorded because this account is the organizer of the event.'
                 );
             }
 
@@ -109,7 +115,7 @@ export class RespondToEventHandler extends BaseToolHandler {
             });
 
             if (!updateResponse.data) {
-                throw new Error('Failed to update event response');
+                throw localEnvelopeError('unexpected_response', 'Google accepted the response but returned nothing.');
             }
 
             // 7. Create structured response
@@ -132,10 +138,10 @@ export class RespondToEventHandler extends BaseToolHandler {
 
             return createStructuredResponse(response);
         } catch (error: any) {
-            if (error instanceof RecurringEventError) {
+            if (isEnvelopeError(error)) {
                 throw error;
             }
-            throw this.handleGoogleApiError(error);
+            throw this.handleGoogleApiError(error, `respond to event "${validArgs.eventId}"`);
         }
     }
 }

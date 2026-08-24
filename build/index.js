@@ -221,12 +221,181 @@ import { fileURLToPath as fileURLToPath4 } from "url";
 
 // src/server.ts
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { McpError as McpError5, ErrorCode as ErrorCode5 } from "@modelcontextprotocol/sdk/types.js";
+import { McpError as McpError2, ErrorCode as ErrorCode2 } from "@modelcontextprotocol/sdk/types.js";
+
+// src/utils/failure-envelope.ts
+var MAX_BODY_CHARS = 4e3;
+var TRUNCATION_MARKER = " ...[truncated]";
+var REASON_PHRASES = {
+  400: "Bad Request",
+  401: "Unauthorized",
+  402: "Payment Required",
+  403: "Forbidden",
+  404: "Not Found",
+  405: "Method Not Allowed",
+  406: "Not Acceptable",
+  408: "Request Timeout",
+  409: "Conflict",
+  410: "Gone",
+  412: "Precondition Failed",
+  413: "Payload Too Large",
+  415: "Unsupported Media Type",
+  422: "Unprocessable Entity",
+  423: "Locked",
+  428: "Precondition Required",
+  429: "Too Many Requests",
+  500: "Internal Server Error",
+  501: "Not Implemented",
+  502: "Bad Gateway",
+  503: "Service Unavailable",
+  504: "Gateway Timeout"
+};
+var STATUS_CLAUSES = {
+  400: "the request was rejected as invalid",
+  401: "the request was not authorised",
+  403: "the request was forbidden",
+  404: "it was not found",
+  409: "it conflicts with something that already exists",
+  410: "it is gone",
+  429: "the rate limit was reached"
+};
+var SECRET_KEYS = [
+  "access_token",
+  "refresh_token",
+  "id_token",
+  "client_secret",
+  "client_id",
+  "authorization",
+  "proxy-authorization",
+  "cookie",
+  "set-cookie",
+  "api_key",
+  "apikey",
+  "x-goog-api-key"
+];
+var REDACTED = "<redacted>";
+var KEY_ALTERNATION = SECRET_KEYS.join("|");
+var JSON_SECRET = new RegExp(
+  `(["']?(?:${KEY_ALTERNATION})["']?\\s*[:=]\\s*)(["'])[^"']*(["'])`,
+  "gi"
+);
+var HEADER_SECRET = new RegExp(`^(\\s*(?:${KEY_ALTERNATION})\\s*:\\s*)[^\\r\\n]+`, "gim");
+var QUERY_SECRET = new RegExp(`((?:${KEY_ALTERNATION})=)[^&\\s"']+`, "gi");
+var BEARER = /\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi;
+function redactSecrets(input) {
+  if (!input) return input;
+  return input.replace(JSON_SECRET, (_m, prefix, openQuote, closeQuote) => `${prefix}${openQuote}${REDACTED}${closeQuote}`).replace(HEADER_SECRET, (_m, prefix) => `${prefix}${REDACTED}`).replace(QUERY_SECRET, (_m, prefix) => `${prefix}${REDACTED}`).replace(BEARER, (_m, scheme) => `${scheme} ${REDACTED}`);
+}
+function capBody(body) {
+  if (body.length <= MAX_BODY_CHARS) return body;
+  return body.slice(0, MAX_BODY_CHARS) + TRUNCATION_MARKER;
+}
+function bodyToText(body) {
+  if (body === void 0 || body === null) return void 0;
+  if (typeof body === "string") return body;
+  try {
+    return JSON.stringify(body);
+  } catch {
+    return String(body);
+  }
+}
+function reasonPhrase(status, literal) {
+  if (literal && literal.trim().length > 0) return literal.trim();
+  return REASON_PHRASES[status] ?? "";
+}
+function statusLineFor(status, literal) {
+  const phrase = reasonPhrase(status, literal);
+  return phrase ? `HTTP ${status} ${phrase}` : `HTTP ${status}`;
+}
+function summaryForStatus(action, status) {
+  const clause = STATUS_CLAUSES[status] ?? (status >= 500 ? "Google reported a server error" : void 0);
+  return clause ? `Could not ${action}: ${clause}.` : `Could not ${action}.`;
+}
+function formatEnvelope(parts) {
+  const lines = [`[${parts.code}] ${parts.summary}`];
+  if (parts.statusLine) lines.push(parts.statusLine);
+  const body = parts.body === void 0 ? void 0 : capBody(redactSecrets(parts.body));
+  if (body !== void 0 && body.length > 0) lines.push(body);
+  return lines.join("\n");
+}
+var EnvelopeError = class extends Error {
+  envelopeCode;
+  summary;
+  statusLine;
+  body;
+  status;
+  constructor(parts) {
+    super(formatEnvelope(parts));
+    this.name = "EnvelopeError";
+    this.envelopeCode = parts.code;
+    this.summary = parts.summary;
+    this.statusLine = parts.statusLine;
+    this.body = parts.body;
+    this.status = parts.status;
+  }
+  /** The full envelope text. */
+  get envelope() {
+    return this.message;
+  }
+};
+function httpEnvelopeError(options) {
+  return new EnvelopeError({
+    code: `http_${options.status}`,
+    summary: options.summary ?? summaryForStatus(options.action, options.status),
+    statusLine: statusLineFor(options.status, options.statusText),
+    body: bodyToText(options.body),
+    status: options.status
+  });
+}
+function localEnvelopeError(code, summary, body) {
+  return new EnvelopeError({ code, summary, body });
+}
+function isEnvelopeError(error) {
+  return error instanceof EnvelopeError;
+}
+function envelopeErrorFor(error, action) {
+  if (isEnvelopeError(error)) return error;
+  const response = error?.response;
+  const status = response?.status ?? (typeof error?.code === "number" ? error.code : void 0);
+  if (typeof status === "number") {
+    return httpEnvelopeError({
+      action,
+      status,
+      statusText: response?.statusText,
+      body: response?.data ?? (error instanceof Error ? error.message : void 0)
+    });
+  }
+  const transportCode = String(error?.code ?? "").toUpperCase();
+  if (transportCode) {
+    const code = transportCode === "ETIMEDOUT" || transportCode === "ECONNABORTED" || transportCode === "ERR_CANCELED" ? "timeout" : "network_error";
+    return localEnvelopeError(
+      code,
+      `Could not ${action}: the request did not complete.`,
+      error instanceof Error ? error.message : String(error)
+    );
+  }
+  if (error instanceof Error) {
+    const code = error.name === "ZodError" ? "bad_request" : "internal_error";
+    return localEnvelopeError(code, `Could not ${action}.`, error.message);
+  }
+  return localEnvelopeError(
+    "internal_error",
+    `Could not ${action}.`,
+    typeof error === "string" ? error : bodyToText(error)
+  );
+}
+function envelopeTextFor(error, action) {
+  return envelopeErrorFor(error, action).envelope;
+}
+function toEnvelopeResult(error, action) {
+  return {
+    isError: true,
+    content: [{ type: "text", text: envelopeTextFor(error, action) }]
+  };
+}
 
 // src/circuitBuffer.ts
 var THRESHOLD = 200;
-var CircuitError = class extends Error {
-};
 function cfg() {
   const url = (process.env.MAESTRO_CIRCUIT_URL || "").trim();
   const secret = (process.env.MAESTRO_CIRCUIT_SECRET || "").trim();
@@ -244,7 +413,10 @@ async function post(path4, body, url, secret) {
 async function fetchSlug(slug, c) {
   const { status, json } = await post("/get", { session: c.session, slug }, c.url, c.secret);
   if (status === 404) {
-    throw new CircuitError(`Unknown or expired circuit slug ${slug}; it is no longer cached, re-fetch it.`);
+    throw localEnvelopeError(
+      "circuit_slug_expired",
+      `The handle ${slug} could not be expanded because it is no longer cached.`
+    );
   }
   return json && json.payload || "";
 }
@@ -274,6 +446,7 @@ async function resolveArgs(args) {
 async function wrapResult(result) {
   const c = cfg();
   if (!c || !result || !Array.isArray(result.content)) return result;
+  if (result.isError) return result;
   const first = result.content[0];
   if (!first || first.type !== "text" || typeof first.text !== "string" || first.text.length < THRESHOLD) {
     return result;
@@ -1344,7 +1517,11 @@ function validateFields(fields) {
     }
   }
   if (invalidFields.length > 0) {
-    throw new Error(`Invalid fields requested: ${invalidFields.join(", ")}. Allowed fields: ${ALLOWED_EVENT_FIELDS.join(", ")}`);
+    throw localEnvelopeError(
+      "bad_request",
+      `Invalid fields requested: ${invalidFields.join(", ")}.`,
+      `Allowed fields: ${ALLOWED_EVENT_FIELDS.join(", ")}`
+    );
   }
   return validFields;
 }
@@ -1378,8 +1555,6 @@ function buildListFieldMask(requestedFields, includeDefaults = true) {
 
 // src/handlers/core/BaseToolHandler.ts
 init_utils();
-import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
-import { GaxiosError as GaxiosError2 } from "gaxios";
 import { google as google2 } from "googleapis";
 
 // src/services/CalendarRegistry.ts
@@ -1398,6 +1573,9 @@ var CalendarRegistry = class _CalendarRegistry {
   // 5 minutes
   // Track in-flight requests to prevent duplicate API calls during concurrent access
   inFlightRequests = /* @__PURE__ */ new Map();
+  // Accounts whose calendar list could not be read on the most recent fetch. A calendar missing
+  // because its account is broken must never be reported as a calendar that does not exist.
+  lastAccessFailures = [];
   /**
    * Get the singleton instance of CalendarRegistry
    */
@@ -1455,9 +1633,21 @@ var CalendarRegistry = class _CalendarRegistry {
     }
   }
   /**
+   * The accounts whose calendar list could not be read on the most recent fetch. Empty when every
+   * account answered.
+   */
+  getAccessFailures() {
+    return this.lastAccessFailures;
+  }
+  /** The first account failure from the most recent fetch, if there was one. */
+  getLastAccessFailure() {
+    return this.lastAccessFailures[0];
+  }
+  /**
    * Internal method to fetch calendars and build the unified registry
    */
   async fetchAndBuildUnifiedCalendars(accounts, cacheKey) {
+    const failures = [];
     const calendarsByAccount = await Promise.all(
       Array.from(accounts.entries()).map(async ([accountId2, client]) => {
         try {
@@ -1468,6 +1658,7 @@ var CalendarRegistry = class _CalendarRegistry {
             calendars: response.data.items || []
           };
         } catch (error) {
+          failures.push({ accountId: accountId2, error });
           return {
             accountId: accountId2,
             calendars: []
@@ -1475,6 +1666,10 @@ var CalendarRegistry = class _CalendarRegistry {
         }
       })
     );
+    this.lastAccessFailures = failures;
+    if (failures.length > 0 && failures.length === accounts.size) {
+      throw failures[0].error;
+    }
     const calendarMap = /* @__PURE__ */ new Map();
     for (const { accountId: accountId2, calendars } of calendarsByAccount) {
       for (const cal of calendars) {
@@ -1684,7 +1879,7 @@ function convertToRFC3339(datetime, fallbackTimezone) {
     try {
       const match = datetime.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})$/);
       if (!match) {
-        throw new Error("Invalid datetime format");
+        throw localEnvelopeError("bad_request", "Invalid datetime format.");
       }
       const [, year, month, day, hour, minute, second] = match.map(Number);
       const utcDate = new Date(Date.UTC(year, month - 1, day, hour, minute, second));
@@ -1723,7 +1918,7 @@ function createTimeObject(input, fallbackTimezone) {
     try {
       const obj = JSON.parse(trimmedInput);
       if (obj.date !== void 0 && obj.dateTime !== void 0) {
-        throw new Error("Cannot specify both 'date' and 'dateTime' in time input");
+        throw localEnvelopeError("bad_request", "Cannot specify both 'date' and 'dateTime' in time input.");
       }
       if (obj.date) {
         return { date: obj.date };
@@ -1731,10 +1926,10 @@ function createTimeObject(input, fallbackTimezone) {
       if (obj.dateTime) {
         if (obj.timeZone !== void 0) {
           if (typeof obj.timeZone !== "string") {
-            throw new Error("timeZone must be a string (IANA timezone, e.g., 'America/Los_Angeles')");
+            throw localEnvelopeError("bad_request", "timeZone must be a string (IANA timezone, e.g., 'America/Los_Angeles').");
           }
           if (obj.timeZone.trim() === "") {
-            throw new Error("timeZone cannot be empty - provide a valid IANA timezone (e.g., 'America/Los_Angeles') or omit the field");
+            throw localEnvelopeError("bad_request", "timeZone cannot be empty: provide a valid IANA timezone (e.g., 'America/Los_Angeles') or omit the field.");
           }
         }
         if (hasTimezoneInDatetime(obj.dateTime)) {
@@ -1745,10 +1940,10 @@ function createTimeObject(input, fallbackTimezone) {
           return { dateTime: obj.dateTime, timeZone: fallbackTimezone };
         }
       }
-      throw new Error("Invalid time object: must have either dateTime or date");
+      throw localEnvelopeError("bad_request", "Invalid time object: must have either dateTime or date.");
     } catch (e) {
       if (e instanceof SyntaxError) {
-        throw new Error("Invalid JSON in time input");
+        throw localEnvelopeError("bad_request", "Invalid JSON in time input.");
       }
       throw e;
     }
@@ -1781,13 +1976,13 @@ var BaseToolHandler = class {
    * @param accountId Optional account ID. If not provided, uses first available account.
    * @param accounts Map of available accounts
    * @returns OAuth2Client for the specified or first account
-   * @throws McpError if account is invalid or not found
+   * @throws EnvelopeError if account is invalid or not found
    */
   getClientForAccountOrFirst(accountId2, accounts) {
     if (accounts.size === 0) {
-      throw new McpError(
-        ErrorCode.InvalidRequest,
-        "No authenticated accounts available. Please run authentication first."
+      throw localEnvelopeError(
+        "no_credentials",
+        "No Google account is connected to this server."
       );
     }
     if (accountId2) {
@@ -1795,17 +1990,19 @@ var BaseToolHandler = class {
       try {
         validateAccountId(normalizedId);
       } catch (error) {
-        throw new McpError(
-          ErrorCode.InvalidRequest,
-          error instanceof Error ? error.message : "Invalid account ID"
+        throw localEnvelopeError(
+          "bad_request",
+          "The account name is not a valid account name.",
+          error instanceof Error ? error.message : void 0
         );
       }
       const client2 = accounts.get(normalizedId);
       if (!client2) {
         const availableAccounts = Array.from(accounts.keys()).join(", ");
-        throw new McpError(
-          ErrorCode.InvalidRequest,
-          `Account "${normalizedId}" not found. Available accounts: ${availableAccounts}`
+        throw localEnvelopeError(
+          "account_not_found",
+          `There is no connected account called "${normalizedId}".`,
+          `Connected accounts: ${availableAccounts || "none"}`
         );
       }
       return client2;
@@ -1814,9 +2011,9 @@ var BaseToolHandler = class {
     const firstAccountId = sortedAccountIds[0];
     const client = accounts.get(firstAccountId);
     if (!client) {
-      throw new McpError(
-        ErrorCode.InternalError,
-        "Failed to retrieve OAuth client"
+      throw localEnvelopeError(
+        "internal_error",
+        "The connected account could not be loaded."
       );
     }
     return client;
@@ -1826,13 +2023,13 @@ var BaseToolHandler = class {
    * @param accountId Optional account ID. If not provided, uses single account if available.
    * @param accounts Map of available accounts
    * @returns OAuth2Client for the specified or default account
-   * @throws McpError if account is invalid or not found
+   * @throws EnvelopeError if account is invalid or not found
    */
   getClientForAccount(accountId2, accounts) {
     if (accounts.size === 0) {
-      throw new McpError(
-        ErrorCode.InvalidRequest,
-        "No authenticated accounts available. Please run authentication first."
+      throw localEnvelopeError(
+        "no_credentials",
+        "No Google account is connected to this server."
       );
     }
     if (accountId2) {
@@ -1840,17 +2037,19 @@ var BaseToolHandler = class {
       try {
         validateAccountId(normalizedId);
       } catch (error) {
-        throw new McpError(
-          ErrorCode.InvalidRequest,
-          error instanceof Error ? error.message : "Invalid account ID"
+        throw localEnvelopeError(
+          "bad_request",
+          "The account name is not a valid account name.",
+          error instanceof Error ? error.message : void 0
         );
       }
       const client = accounts.get(normalizedId);
       if (!client) {
         const availableAccounts2 = Array.from(accounts.keys()).join(", ");
-        throw new McpError(
-          ErrorCode.InvalidRequest,
-          `Account "${normalizedId}" not found. Available accounts: ${availableAccounts2}`
+        throw localEnvelopeError(
+          "account_not_found",
+          `There is no connected account called "${normalizedId}".`,
+          `Connected accounts: ${availableAccounts2 || "none"}`
         );
       }
       return client;
@@ -1858,17 +2057,18 @@ var BaseToolHandler = class {
     if (accounts.size === 1) {
       const firstClient = accounts.values().next().value;
       if (!firstClient) {
-        throw new McpError(
-          ErrorCode.InternalError,
-          "Failed to retrieve OAuth client"
+        throw localEnvelopeError(
+          "internal_error",
+          "The connected account could not be loaded."
         );
       }
       return firstClient;
     }
     const availableAccounts = Array.from(accounts.keys()).join(", ");
-    throw new McpError(
-      ErrorCode.InvalidRequest,
-      `Multiple accounts available (${availableAccounts}). You must specify the 'account' parameter to indicate which account to use.`
+    throw localEnvelopeError(
+      "account_required",
+      "More than one Google account is connected, so the account to use was ambiguous.",
+      `Connected accounts: ${availableAccounts}`
     );
   }
   /**
@@ -1876,13 +2076,13 @@ var BaseToolHandler = class {
    * @param accountIds Account ID(s) - string, string[], or undefined
    * @param accounts Map of available accounts
    * @returns Map of accountId to OAuth2Client for the specified accounts
-   * @throws McpError if any account is invalid or not found
+   * @throws EnvelopeError if any account is invalid or not found
    */
   getClientsForAccounts(accountIds, accounts) {
     if (accounts.size === 0) {
-      throw new McpError(
-        ErrorCode.InvalidRequest,
-        "No authenticated accounts available. Please run authentication first."
+      throw localEnvelopeError(
+        "no_credentials",
+        "No Google account is connected to this server."
       );
     }
     const ids = this.normalizeAccountIds(accountIds);
@@ -1895,17 +2095,19 @@ var BaseToolHandler = class {
       try {
         validateAccountId(normalizedId);
       } catch (error) {
-        throw new McpError(
-          ErrorCode.InvalidRequest,
-          error instanceof Error ? error.message : "Invalid account ID"
+        throw localEnvelopeError(
+          "bad_request",
+          "The account name is not a valid account name.",
+          error instanceof Error ? error.message : void 0
         );
       }
       const client = accounts.get(normalizedId);
       if (!client) {
         const availableAccounts = Array.from(accounts.keys()).join(", ");
-        throw new McpError(
-          ErrorCode.InvalidRequest,
-          `Account "${normalizedId}" not found. Available accounts: ${availableAccounts}`
+        throw localEnvelopeError(
+          "account_not_found",
+          `There is no connected account called "${normalizedId}".`,
+          `Connected accounts: ${availableAccounts || "none"}`
         );
       }
       result.set(normalizedId, client);
@@ -1957,7 +2159,7 @@ var BaseToolHandler = class {
    * @param accounts Map of available accounts
    * @param operation 'read' or 'write' operation type
    * @returns OAuth2Client, selected account ID, resolved calendar ID, and whether it was auto-selected
-   * @throws McpError if account not found or no suitable account available
+   * @throws EnvelopeError if account not found or no suitable account available
    */
   async getClientWithAutoSelection(accountId2, calendarNameOrId, accounts, operation) {
     if (accountId2) {
@@ -1975,18 +2177,20 @@ var BaseToolHandler = class {
       operation
     );
     if (!resolution) {
+      this.throwCalendarAccessFailureIfAny(`reach calendar "${calendarNameOrId}"`);
       const availableAccounts = Array.from(accounts.keys()).join(", ");
       const accessType = operation === "write" ? "write" : "read";
-      throw new McpError(
-        ErrorCode.InvalidRequest,
-        `No account has ${accessType} access to calendar "${calendarNameOrId}". Available accounts: ${availableAccounts}. Please ensure the calendar exists and you have the necessary permissions, or specify the 'account' parameter explicitly.`
+      throw localEnvelopeError(
+        "calendar_not_found",
+        `No connected account has ${accessType} access to a calendar called "${calendarNameOrId}".`,
+        `Connected accounts: ${availableAccounts}`
       );
     }
     const client = accounts.get(resolution.accountId);
     if (!client) {
-      throw new McpError(
-        ErrorCode.InternalError,
-        `Failed to retrieve client for account "${resolution.accountId}"`
+      throw localEnvelopeError(
+        "internal_error",
+        `The connected account "${resolution.accountId}" could not be loaded.`
       );
     }
     return {
@@ -2008,106 +2212,23 @@ var BaseToolHandler = class {
     return Array.isArray(accountIds) ? accountIds : [accountIds];
   }
   /**
-   * Format a Google API error into a human-readable message without throwing.
-   * Useful when collecting errors in batch operations.
+   * Format a Google API failure as its envelope text without throwing.
+   * Used when collecting failures in batch operations, where each item carries its own evidence.
    */
-  formatGoogleApiError(error) {
-    try {
-      this.handleGoogleApiError(error);
-    } catch (mcpError) {
-      if (mcpError instanceof McpError) return mcpError.message;
-      if (mcpError instanceof Error) return mcpError.message;
-      return "Unknown error";
-    }
-    return "Unknown error";
+  formatGoogleApiError(error, action = "complete the request") {
+    return envelopeTextFor(error, action);
   }
-  handleGoogleApiError(error) {
-    if (error instanceof GaxiosError2) {
-      const status = error.response?.status;
-      const errorData = error.response?.data;
-      if (errorData?.error === "invalid_grant") {
-        throw new McpError(
-          ErrorCode.InvalidRequest,
-          "Authentication token is invalid or expired. Please re-run the authentication process (e.g., `npm run auth`)."
-        );
-      }
-      if (status === 400) {
-        const errorMessage2 = errorData?.error?.message;
-        const errorDetails2 = errorData?.error?.errors?.map(
-          (e) => `${e.message || e.reason}${e.location ? ` (${e.location})` : ""}`
-        ).join("; ");
-        let fullMessage2;
-        if (errorDetails2) {
-          fullMessage2 = `Bad Request: ${errorMessage2 || "Invalid request parameters"}. Details: ${errorDetails2}`;
-        } else if (errorMessage2) {
-          fullMessage2 = `Bad Request: ${errorMessage2}`;
-        } else {
-          const errorStr = JSON.stringify(errorData, null, 2);
-          fullMessage2 = `Bad Request: Invalid request parameters. Raw error: ${errorStr}`;
-        }
-        throw new McpError(
-          ErrorCode.InvalidRequest,
-          fullMessage2
-        );
-      }
-      if (status === 403) {
-        throw new McpError(
-          ErrorCode.InvalidRequest,
-          `Access denied: ${errorData?.error?.message || "Insufficient permissions"}`
-        );
-      }
-      if (status === 404) {
-        throw new McpError(
-          ErrorCode.InvalidRequest,
-          `Resource not found: ${errorData?.error?.message || "The requested calendar or event does not exist"}`
-        );
-      }
-      if (status === 429) {
-        const errorMessage2 = errorData?.error?.message || "";
-        if (errorMessage2.includes("User Rate Limit Exceeded")) {
-          throw new McpError(
-            ErrorCode.InvalidRequest,
-            `Rate limit exceeded. This may be due to missing quota project configuration.
-
-Ensure your OAuth credentials include project_id information:
-1. Check that your gcp-oauth.keys.json file contains project_id
-2. Re-download credentials from Google Cloud Console if needed
-3. The file should have format: {"installed": {"project_id": "your-project-id", ...}}
-
-Original error: ${errorMessage2}`
-          );
-        }
-        throw new McpError(
-          ErrorCode.InternalError,
-          `Rate limit exceeded. Please try again later. ${errorMessage2}`
-        );
-      }
-      if (status && status >= 500) {
-        throw new McpError(
-          ErrorCode.InternalError,
-          `Google API server error: ${errorData?.error?.message || error.message}`
-        );
-      }
-      const errorMessage = errorData?.error?.message || error.message;
-      const errorDetails = errorData?.error?.errors?.map(
-        (e) => `${e.message || e.reason}${e.location ? ` (${e.location})` : ""}`
-      ).join("; ");
-      const fullMessage = errorDetails ? `Google API error: ${errorMessage}. Details: ${errorDetails}` : `Google API error: ${errorMessage}`;
-      throw new McpError(
-        ErrorCode.InvalidRequest,
-        fullMessage
-      );
-    }
-    if (error instanceof Error) {
-      throw new McpError(
-        ErrorCode.InternalError,
-        `Internal error: ${error.message}`
-      );
-    }
-    throw new McpError(
-      ErrorCode.InternalError,
-      "An unknown error occurred"
-    );
+  /**
+   * Turns any failure from the Google API into the uniform envelope
+   * (docs/MCP_FAILURE_ENVELOPE.md): `http_<status>`, the literal status line, and Google's
+   * response body verbatim. Nothing here interprets the body: an expired credential and a
+   * permission the account never had are both 403, and only the body separates them.
+   */
+  toEnvelopeError(error, action) {
+    return envelopeErrorFor(error, action);
+  }
+  handleGoogleApiError(error, action = "complete the request") {
+    throw this.toEnvelopeError(error, action);
   }
   getCalendar(auth) {
     const quotaProjectId = getCredentialsProjectId();
@@ -2154,15 +2275,25 @@ Original error: ${errorMessage2}`
       const calendar = this.getCalendar(client);
       const response = await calendar.calendarList.get({ calendarId });
       if (!response.data) {
-        throw new Error(`Calendar ${calendarId} not found`);
+        throw localEnvelopeError(
+          "unexpected_response",
+          `Google returned no details for calendar "${calendarId}".`
+        );
       }
       return response.data;
     } catch (error) {
-      throw this.handleGoogleApiError(error);
+      throw this.handleGoogleApiError(error, `read the settings of calendar "${calendarId}"`);
     }
   }
   /**
-   * Gets the default timezone for a calendar, falling back to UTC if not available
+   * Gets the default timezone for a calendar.
+   *
+   * A 404 here is an expected absence, not a breakage: the calendar is simply not in this
+   * account's calendar list (a public or resource calendar addressed by id, for example), and
+   * UTC is the documented default. Every OTHER failure is propagated with its envelope. It used
+   * to swallow all of them into 'UTC', which turned an expired credential into a silently
+   * wrong time window (rule 6).
+   *
    * @param client OAuth2Client
    * @param calendarId Calendar ID
    * @returns Timezone string (IANA format)
@@ -2172,7 +2303,10 @@ Original error: ${errorMessage2}`
       const calendarDetails = await this.getCalendarDetails(client, calendarId);
       return calendarDetails.timeZone || "UTC";
     } catch (error) {
-      return "UTC";
+      if (isEnvelopeError(error) && error.status === 404) {
+        return "UTC";
+      }
+      throw error;
     }
   }
   /**
@@ -2214,7 +2348,7 @@ Original error: ${errorMessage2}`
    * @param client OAuth2Client
    * @param nameOrId Calendar name (summary/summaryOverride) or ID
    * @returns Calendar ID
-   * @throws McpError if calendar name cannot be resolved
+   * @throws EnvelopeError if calendar name cannot be resolved
    */
   async resolveCalendarId(client, nameOrId) {
     if (nameOrId === "primary" || nameOrId.includes("@")) {
@@ -2248,16 +2382,27 @@ Original error: ${errorMessage2}`
         }
         return `"${cal.summary}" (${cal.id})`;
       }).join(", ");
-      throw new McpError(
-        ErrorCode.InvalidRequest,
-        `Calendar "${nameOrId}" not found. Available calendars: ${availableCalendars || "none"}. Use 'list-calendars' tool to see all available calendars.`
+      throw localEnvelopeError(
+        "calendar_not_found",
+        `This account has no calendar called "${nameOrId}".`,
+        `Calendars on this account: ${availableCalendars || "none"}`
       );
     } catch (error) {
-      if (error instanceof McpError) {
+      if (isEnvelopeError(error)) {
         throw error;
       }
-      throw this.handleGoogleApiError(error);
+      throw this.handleGoogleApiError(error, "list the calendars on this account");
     }
+  }
+  /**
+   * If the calendar registry could not read one of the connected accounts, that HTTP failure is
+   * the true answer to "why did we not find this calendar", and it is thrown with its own
+   * envelope. Silence here would report a broken account as an empty calendar list.
+   */
+  throwCalendarAccessFailureIfAny(action) {
+    const failure = this.calendarRegistry.getLastAccessFailure();
+    if (!failure) return;
+    throw this.toEnvelopeError(failure.error, action);
   }
   /**
    * Sorts events by start time (chronological order).
@@ -2277,10 +2422,12 @@ Original error: ${errorMessage2}`
    */
   async throwNoCalendarsFoundError(requestedCalendars, selectedAccounts) {
     const allCalendars = await this.calendarRegistry.getUnifiedCalendars(selectedAccounts);
+    this.throwCalendarAccessFailureIfAny("find the requested calendars");
     const calendarList = allCalendars.map((c) => `"${c.displayName}" (${c.calendarId})`).join(", ");
-    throw new McpError(
-      ErrorCode.InvalidRequest,
-      `None of the requested calendars could be found: ${requestedCalendars.map((c) => `"${c}"`).join(", ")}. Available calendars: ${calendarList || "none"}. Use 'list-calendars' to see all available calendars.`
+    throw localEnvelopeError(
+      "calendar_not_found",
+      `None of the requested calendars exist on the connected accounts: ${requestedCalendars.map((c) => `"${c}"`).join(", ")}.`,
+      `Available calendars: ${calendarList || "none"}`
     );
   }
   /**
@@ -2297,14 +2444,14 @@ Original error: ${errorMessage2}`
    * @param client OAuth2Client
    * @param namesOrIds Array of calendar names (summary/summaryOverride) or IDs
    * @returns Array of resolved calendar IDs
-   * @throws McpError if any calendar name cannot be resolved
+   * @throws EnvelopeError if any calendar name cannot be resolved
    */
   async resolveCalendarIds(client, namesOrIds) {
     const validInputs = namesOrIds.filter((item) => item && item.trim().length > 0);
     if (validInputs.length === 0) {
-      throw new McpError(
-        ErrorCode.InvalidRequest,
-        "At least one valid calendar identifier is required"
+      throw localEnvelopeError(
+        "bad_request",
+        "No calendar was named in the request."
       );
     }
     const needsResolution = validInputs.some(
@@ -2363,10 +2510,10 @@ Original error: ${errorMessage2}`
         }
         return `"${cal.summary}" (${cal.id})`;
       }).join(", ");
-      const errorMessage = `Calendar(s) not found: ${errors.map((e) => `"${e}"`).join(", ")}. Available calendars: ${availableCalendars || "none"}. Use 'list-calendars' tool to see all available calendars.`;
-      throw new McpError(
-        ErrorCode.InvalidRequest,
-        errorMessage
+      throw localEnvelopeError(
+        "calendar_not_found",
+        `This account has no calendar called ${errors.map((e) => `"${e}"`).join(", ")}.`,
+        `Calendars on this account: ${availableCalendars || "none"}`
       );
     }
     return resolvedIds;
@@ -2524,15 +2671,21 @@ var ListCalendarsHandler = class extends BaseToolHandler {
       const response = await calendar.calendarList.list();
       return response.data.items || [];
     } catch (error) {
-      throw this.handleGoogleApiError(error);
+      throw this.handleGoogleApiError(error, "list the calendars");
     }
   }
 };
 
 // src/handlers/core/BatchRequestHandler.ts
-var BatchRequestError = class extends Error {
-  constructor(message, errors, partial = false) {
-    super(message);
+var BatchRequestError = class extends EnvelopeError {
+  constructor(summary, errors, partial = false, envelope) {
+    super({
+      code: envelope?.code ?? "batch_failed",
+      summary,
+      statusLine: envelope?.statusLine,
+      body: envelope?.body,
+      status: envelope?.status
+    });
     this.errors = errors;
     this.partial = partial;
     this.name = "BatchRequestError";
@@ -2553,7 +2706,10 @@ var BatchRequestHandler = class {
       return [];
     }
     if (requests.length > 50) {
-      throw new Error("Batch requests cannot exceed 50 requests per batch");
+      throw localEnvelopeError(
+        "bad_request",
+        `A batch may hold at most 50 requests, and ${requests.length} were given.`
+      );
     }
     return this.executeBatchWithRetry(requests, 0);
   }
@@ -2580,12 +2736,19 @@ var BatchRequestHandler = class {
       }
       if (!response.ok) {
         throw new BatchRequestError(
-          `Batch request failed: ${response.status} ${response.statusText}`,
+          "Could not read the calendars: the batch request was refused.",
           [{
             statusCode: response.status,
-            message: `HTTP ${response.status}: ${response.statusText}`,
+            message: statusLineFor(response.status, response.statusText),
             details: responseText
-          }]
+          }],
+          false,
+          {
+            code: `http_${response.status}`,
+            statusLine: statusLineFor(response.status, response.statusText),
+            body: responseText,
+            status: response.status
+          }
         );
       }
       return this.parseBatchResponse(responseText);
@@ -2600,13 +2763,16 @@ var BatchRequestHandler = class {
         await this.sleep(delay);
         return this.executeBatchWithRetry(requests, attempt + 1);
       }
+      const detail = error instanceof Error ? error.message : String(error);
       throw new BatchRequestError(
-        `Failed to execute batch request: ${error instanceof Error ? error.message : "Unknown error"}`,
+        "Could not read the calendars: the batch request did not complete.",
         [{
           statusCode: 0,
-          message: error instanceof Error ? error.message : "Unknown error",
-          details: error
-        }]
+          message: detail,
+          details: detail
+        }],
+        false,
+        { code: "network_error", body: detail }
       );
     }
   }
@@ -2663,7 +2829,11 @@ var BatchRequestHandler = class {
       }
     }
     if (!boundary) {
-      throw new Error("Could not find boundary in batch response");
+      throw localEnvelopeError(
+        "unexpected_response",
+        "Google returned a batch response that could not be read.",
+        responseText
+      );
     }
     const parts = responseText.split(`--${boundary}`);
     const responses = [];
@@ -2880,12 +3050,14 @@ var ListEventsHandler = class extends BaseToolHandler {
       const [accountId2] = selectedAccounts.keys();
       accountCalendarMap = /* @__PURE__ */ new Map([[accountId2, calendarNamesOrIds]]);
     }
+    const failures = [];
+    let succeededCalendars = 0;
     const eventsPerAccount = await Promise.all(
       Array.from(accountCalendarMap.entries()).map(async ([accountId2, calendarsForAccount]) => {
         const client = selectedAccounts.get(accountId2);
         try {
           const calendarIds = selectedAccounts.size === 1 ? await this.resolveCalendarIds(client, calendarsForAccount) : calendarsForAccount;
-          const events = await this.fetchEvents(client, calendarIds, {
+          const { events, failures: calendarFailures } = await this.fetchEvents(client, calendarIds, {
             timeMin: args.timeMin,
             timeMax: args.timeMax,
             timeZone: args.timeZone,
@@ -2893,6 +3065,14 @@ var ListEventsHandler = class extends BaseToolHandler {
             privateExtendedProperty: args.privateExtendedProperty,
             sharedExtendedProperty: args.sharedExtendedProperty
           });
+          succeededCalendars += calendarIds.length - calendarFailures.length;
+          for (const failure of calendarFailures) {
+            failures.push(failure.error);
+            partialFailures.push({
+              accountId: accountId2,
+              reason: `calendar "${failure.calendarId}": ${envelopeTextFor(failure.error, `list events in calendar "${failure.calendarId}"`)}`
+            });
+          }
           return {
             accountId: accountId2,
             calendarIds,
@@ -2902,17 +3082,18 @@ var ListEventsHandler = class extends BaseToolHandler {
           if (selectedAccounts.size === 1) {
             throw error;
           }
-          const reason = error instanceof Error ? error.message : String(error);
+          failures.push(error);
           partialFailures.push({
             accountId: accountId2,
-            reason
+            reason: envelopeTextFor(error, `list events for account "${accountId2}"`)
           });
-          process.stderr.write(`Warning: Failed to load events for account "${accountId2}": ${reason}
-`);
           return { accountId: accountId2, calendarIds: [], events: [] };
         }
       })
     );
+    if (succeededCalendars === 0 && failures.length > 0) {
+      throw this.toEnvelopeError(failures[0], "list the events");
+    }
     const allEvents = eventsPerAccount.flatMap((result) => result.events);
     const allQueriedCalendarIds = [...new Set(eventsPerAccount.flatMap((result) => result.calendarIds))];
     this.sortEventsByStartTime(allEvents);
@@ -2947,7 +3128,8 @@ var ListEventsHandler = class extends BaseToolHandler {
   }
   async fetchEvents(client, calendarIds, options) {
     if (calendarIds.length === 1) {
-      return this.fetchSingleCalendarEvents(client, calendarIds[0], options);
+      const events = await this.fetchSingleCalendarEvents(client, calendarIds[0], options);
+      return { events, failures: [] };
     }
     return this.fetchMultipleCalendarEvents(client, calendarIds, options);
   }
@@ -2977,7 +3159,7 @@ var ListEventsHandler = class extends BaseToolHandler {
         calendarId
       }));
     } catch (error) {
-      throw this.handleGoogleApiError(error);
+      throw this.handleGoogleApiError(error, `list events in calendar "${calendarId}"`);
     }
   }
   async fetchMultipleCalendarEvents(client, calendarIds, options) {
@@ -2987,12 +3169,8 @@ var ListEventsHandler = class extends BaseToolHandler {
       path: await this.buildEventsPath(client, calendarId, options)
     })));
     const responses = await batchHandler.executeBatch(requests);
-    const { events, errors } = this.processBatchResponses(responses, calendarIds);
-    if (errors.length > 0) {
-      process.stderr.write(`Some calendars had errors: ${errors.map((e) => `${e.calendarId}: ${e.error}`).join(", ")}
-`);
-    }
-    return this.sortEventsByStartTime(events);
+    const { events, failures } = this.processBatchResponses(responses, calendarIds);
+    return { events: this.sortEventsByStartTime(events), failures };
   }
   async buildEventsPath(client, calendarId, options) {
     const { timeMin, timeMax } = await this.normalizeTimeRange(
@@ -3020,7 +3198,7 @@ var ListEventsHandler = class extends BaseToolHandler {
   }
   processBatchResponses(responses, calendarIds) {
     const events = [];
-    const errors = [];
+    const failures = [];
     responses.forEach((response, index) => {
       const calendarId = calendarIds[index];
       if (response.statusCode === 200 && response.body?.items) {
@@ -3030,11 +3208,17 @@ var ListEventsHandler = class extends BaseToolHandler {
         }));
         events.push(...calendarEvents);
       } else {
-        const errorMessage = response.body?.error?.message || response.body?.message || `HTTP ${response.statusCode}`;
-        errors.push({ calendarId, error: errorMessage });
+        failures.push({
+          calendarId,
+          error: httpEnvelopeError({
+            action: `list events in calendar "${calendarId}"`,
+            status: response.statusCode,
+            body: response.body
+          })
+        });
       }
     });
-    return { events, errors };
+    return { events, failures };
   }
 };
 
@@ -3068,6 +3252,7 @@ var SearchEventsHandler = class extends BaseToolHandler {
     }
     const allEvents = [];
     const queriedCalendarIds = [];
+    const failures = [];
     await Promise.all(
       Array.from(accountCalendarMap.entries()).map(async ([accountId2, calendarIds]) => {
         const client = selectedAccounts.get(accountId2);
@@ -3087,8 +3272,10 @@ var SearchEventsHandler = class extends BaseToolHandler {
             queriedCalendarIds.push(calendarId);
           } catch (error) {
             if (accountCalendarMap.size > 1 || calendarIds.length > 1) {
-              const message = error instanceof Error ? error.message : String(error);
-              resolutionWarnings.push(`Failed to search calendar "${calendarId}" on account "${accountId2}": ${message}`);
+              failures.push(error);
+              resolutionWarnings.push(
+                `Calendar "${calendarId}" on account "${accountId2}" could not be searched: ` + envelopeTextFor(error, `search calendar "${calendarId}"`)
+              );
             } else {
               throw error;
             }
@@ -3096,6 +3283,9 @@ var SearchEventsHandler = class extends BaseToolHandler {
         }
       })
     );
+    if (queriedCalendarIds.length === 0 && failures.length > 0) {
+      throw this.toEnvelopeError(failures[0], "search the events");
+    }
     this.sortEventsByStartTime(allEvents);
     const structuredEvents = allEvents.map(
       (event) => convertGoogleEventToStructured(event, event.calendarId, event.accountId)
@@ -3152,7 +3342,7 @@ var SearchEventsHandler = class extends BaseToolHandler {
       });
       return response.data.items || [];
     } catch (error) {
-      throw this.handleGoogleApiError(error);
+      throw this.handleGoogleApiError(error, `search calendar "${args.calendarId}"`);
     }
   }
 };
@@ -3170,33 +3360,29 @@ var GetEventHandler = class extends BaseToolHandler {
     try {
       const argsWithResolvedCalendar = { ...validArgs, calendarId: resolvedCalendarId };
       const event = await this.getEvent(oauth2Client, argsWithResolvedCalendar);
-      if (!event) {
-        throw new Error(`Event with ID '${validArgs.eventId}' not found in calendar '${resolvedCalendarId}'.`);
-      }
       const response = {
         event: convertGoogleEventToStructured(event, resolvedCalendarId, selectedAccountId)
       };
       return createStructuredResponse(response);
     } catch (error) {
-      throw this.handleGoogleApiError(error);
+      throw this.handleGoogleApiError(error, `read event "${validArgs.eventId}"`);
     }
   }
   async getEvent(client, args) {
     const calendar = this.getCalendar(client);
     const fieldMask = buildSingleEventFieldMask(args.fields);
-    try {
-      const response = await calendar.events.get({
-        calendarId: args.calendarId,
-        eventId: args.eventId,
-        ...fieldMask && { fields: fieldMask }
-      });
-      return response.data;
-    } catch (error) {
-      if (error?.code === 404 || error?.response?.status === 404) {
-        return null;
-      }
-      throw error;
+    const response = await calendar.events.get({
+      calendarId: args.calendarId,
+      eventId: args.eventId,
+      ...fieldMask && { fields: fieldMask }
+    });
+    if (!response.data) {
+      throw localEnvelopeError(
+        "unexpected_response",
+        `Google returned no event for id "${args.eventId}".`
+      );
     }
+    return response.data;
   }
 };
 
@@ -3231,10 +3417,12 @@ var ListColorsHandler = class extends BaseToolHandler {
     try {
       const calendar = this.getCalendar(client);
       const response = await calendar.colors.get();
-      if (!response.data) throw new Error("Failed to retrieve colors");
+      if (!response.data) {
+        throw localEnvelopeError("unexpected_response", "Google returned no colours.");
+      }
       return response.data;
     } catch (error) {
-      throw this.handleGoogleApiError(error);
+      throw this.handleGoogleApiError(error, "list the calendar colours");
     }
   }
 };
@@ -3259,7 +3447,11 @@ function validateEventId(eventId) {
     if (!/^[a-v0-9]+$/.test(eventId)) {
       errors.push("can only contain lowercase letters a-v and digits 0-9 (base32hex encoding)");
     }
-    throw new Error(`Invalid event ID: ${errors.join(", ")}`);
+    throw localEnvelopeError(
+      "bad_request",
+      "The event id given is not a valid Google Calendar event id.",
+      `Invalid event ID: ${errors.join(", ")}`
+    );
   }
 }
 
@@ -3695,8 +3887,9 @@ var CreateEventHandler = class extends BaseToolHandler {
     if (validArgs.eventType === "outOfOffice" || validArgs.eventType === "workingLocation") {
       if (resolvedCalendarId !== "primary" && !resolvedCalendarId.includes("@")) {
         const eventTypeName = validArgs.eventType === "outOfOffice" ? "Out of Office" : "Working Location";
-        throw new Error(
-          `${eventTypeName} events can only be created on the primary calendar. Use calendarId: "primary" or your email address.`
+        throw localEnvelopeError(
+          "bad_request",
+          `${eventTypeName} events can only be created on the primary calendar, and "${resolvedCalendarId}" is not it.`
         );
       }
     }
@@ -3724,8 +3917,10 @@ var CreateEventHandler = class extends BaseToolHandler {
       (dup) => dup.event.similarity >= CONFLICT_DETECTION_CONFIG.DUPLICATE_THRESHOLDS.BLOCKING
     );
     if (exactDuplicate && validArgs.allowDuplicates !== true) {
-      throw new Error(
-        `Duplicate event detected (${Math.round(exactDuplicate.event.similarity * 100)}% similar). Event "${exactDuplicate.event.title}" already exists. To create anyway, set allowDuplicates to true.`
+      throw localEnvelopeError(
+        "duplicate_event",
+        `The event was not created because "${exactDuplicate.event.title}" already exists and is ${Math.round(exactDuplicate.event.similarity * 100)}% similar.`,
+        `Set allowDuplicates to true to create it anyway.`
       );
     }
     const argsWithResolvedCalendar = { ...validArgs, calendarId: resolvedCalendarId };
@@ -3784,13 +3979,12 @@ var CreateEventHandler = class extends BaseToolHandler {
         ...conferenceDataVersion && { conferenceDataVersion },
         ...supportsAttachments && { supportsAttachments }
       });
-      if (!response.data) throw new Error("Failed to create event, no data returned");
+      if (!response.data) {
+        throw localEnvelopeError("unexpected_response", "Google accepted the event but returned nothing.");
+      }
       return response.data;
     } catch (error) {
-      if (error?.code === 409 || error?.response?.status === 409) {
-        throw new Error(`Event ID '${args.eventId}' already exists. Please use a different ID.`);
-      }
-      throw this.handleGoogleApiError(error);
+      throw this.handleGoogleApiError(error, "create the event");
     }
   }
   /**
@@ -3827,7 +4021,10 @@ var CreateEventHandler = class extends BaseToolHandler {
   buildWorkingLocationProperties(args) {
     const props = args.workingLocationProperties;
     if (!props) {
-      throw new Error('workingLocationProperties is required when eventType is "workingLocation"');
+      throw localEnvelopeError(
+        "bad_request",
+        "A workingLocation event was requested without workingLocationProperties."
+      );
     }
     const properties = {
       type: props.type
@@ -3885,6 +4082,7 @@ var CreateEventsHandler = class extends BaseToolHandler {
     const timezoneCache = /* @__PURE__ */ new Map();
     const created = [];
     const failed = [];
+    let firstError;
     let consecutiveFailures = 0;
     let lastErrorMessage = "";
     const MAX_CONSECUTIVE_FAILURES = 3;
@@ -3944,7 +4142,7 @@ var CreateEventsHandler = class extends BaseToolHandler {
           ...conferenceDataVersion && { conferenceDataVersion }
         });
         if (!response2.data) {
-          throw new Error("Failed to create event, no data returned");
+          throw localEnvelopeError("unexpected_response", "Google accepted the event but returned nothing.");
         }
         created.push(
           convertGoogleEventToStructured(response2.data, resolvedCalendarId, selectedAccountId)
@@ -3952,7 +4150,10 @@ var CreateEventsHandler = class extends BaseToolHandler {
         consecutiveFailures = 0;
         lastErrorMessage = "";
       } catch (error) {
-        const errorMessage = this.formatGoogleApiError(error);
+        if (firstError === void 0) {
+          firstError = error;
+        }
+        const errorMessage = this.formatGoogleApiError(error, "create the event");
         failed.push({
           index: i,
           summary: eventInput.summary,
@@ -3983,11 +4184,9 @@ var CreateEventsHandler = class extends BaseToolHandler {
       created,
       ...failed.length > 0 && { failed }
     };
-    if (created.length === 0) {
-      return {
-        ...createStructuredResponse(response),
-        isError: true
-      };
+    if (created.length === 0 && firstError !== void 0) {
+      const action = validArgs.events.length === 1 ? "create the requested event" : `create any of the ${validArgs.events.length} requested events`;
+      throw this.toEnvelopeError(firstError, action);
     }
     return createStructuredResponse(response);
   }
@@ -4049,7 +4248,7 @@ var RecurringEventHelpers = class {
    */
   updateRecurrenceWithUntil(recurrence, untilDate) {
     if (!recurrence || recurrence.length === 0) {
-      throw new Error("No recurrence rule found");
+      throw localEnvelopeError("not_recurring", "The event has no recurrence rule to change.");
     }
     const updatedRecurrence = [];
     let foundRRule = false;
@@ -4063,7 +4262,7 @@ var RecurringEventHelpers = class {
       }
     }
     if (!foundRRule) {
-      throw new Error("No RRULE found in recurrence rules");
+      throw localEnvelopeError("not_recurring", "The event has no RRULE in its recurrence rules.");
     }
     return updatedRecurrence;
   }
@@ -4123,10 +4322,10 @@ var RecurringEventHelpers = class {
     return requestBody;
   }
 };
-var RecurringEventError = class extends Error {
+var RecurringEventError = class extends EnvelopeError {
   code;
   constructor(message, code) {
-    super(message);
+    super({ code: code.toLowerCase(), summary: message });
     this.name = "RecurringEventError";
     this.code = code;
   }
@@ -4158,7 +4357,10 @@ var UpdateEventHandler = class extends BaseToolHandler {
       });
       existingEvent = existingEventResponse.data;
       if (!existingEvent) {
-        throw new Error("Event not found");
+        throw localEnvelopeError(
+          "unexpected_response",
+          `Google returned no event for id "${validArgs.eventId}".`
+        );
       }
     }
     let conflicts = null;
@@ -4233,10 +4435,10 @@ var UpdateEventHandler = class extends BaseToolHandler {
           );
       }
     } catch (error) {
-      if (error instanceof RecurringEventError) {
+      if (isEnvelopeError(error)) {
         throw error;
       }
-      throw this.handleGoogleApiError(error);
+      throw this.handleGoogleApiError(error, `update event "${args.eventId}"`);
     }
   }
   async updateSingleInstance(helpers, args, defaultTimeZone) {
@@ -4258,7 +4460,9 @@ var UpdateEventHandler = class extends BaseToolHandler {
       ...conferenceDataVersion && { conferenceDataVersion },
       ...supportsAttachments && { supportsAttachments }
     });
-    if (!response.data) throw new Error("Failed to update event instance");
+    if (!response.data) {
+      throw localEnvelopeError("unexpected_response", "Google accepted the change but returned nothing.");
+    }
     return response.data;
   }
   async updateAllInstances(helpers, args, defaultTimeZone) {
@@ -4273,7 +4477,9 @@ var UpdateEventHandler = class extends BaseToolHandler {
       ...conferenceDataVersion && { conferenceDataVersion },
       ...supportsAttachments && { supportsAttachments }
     });
-    if (!response.data) throw new Error("Failed to update event");
+    if (!response.data) {
+      throw localEnvelopeError("unexpected_response", "Google accepted the change but returned nothing.");
+    }
     return response.data;
   }
   async updateFutureInstances(helpers, args, defaultTimeZone) {
@@ -4291,7 +4497,10 @@ var UpdateEventHandler = class extends BaseToolHandler {
     });
     const originalEvent = originalResponse.data;
     if (!originalEvent.recurrence) {
-      throw new Error("Event does not have recurrence rules");
+      throw localEnvelopeError(
+        "not_recurring",
+        `Event "${args.eventId}" is not a recurring event, so following instances cannot be changed.`
+      );
     }
     const untilDate = helpers.calculateUntilDate(args.futureStartDate);
     const updatedRecurrence = helpers.updateRecurrenceWithUntil(originalEvent.recurrence, untilDate);
@@ -4326,7 +4535,9 @@ var UpdateEventHandler = class extends BaseToolHandler {
       ...conferenceDataVersion && { conferenceDataVersion },
       ...supportsAttachments && { supportsAttachments }
     });
-    if (!response.data) throw new Error("Failed to create new recurring event");
+    if (!response.data) {
+      throw localEnvelopeError("unexpected_response", "Google accepted the new recurring event but returned nothing.");
+    }
     return response.data;
   }
   /**
@@ -4383,34 +4594,36 @@ var DeleteEventHandler = class extends BaseToolHandler {
         sendUpdates: args.sendUpdates
       });
     } catch (error) {
-      throw this.handleGoogleApiError(error);
+      throw this.handleGoogleApiError(error, `delete event "${args.eventId}"`);
     }
   }
 };
 
 // src/handlers/core/FreeBusyEventHandler.ts
-import { McpError as McpError2, ErrorCode as ErrorCode2 } from "@modelcontextprotocol/sdk/types.js";
 var FreeBusyEventHandler = class extends BaseToolHandler {
   async runTool(args, accounts) {
     const validArgs = args;
     if (!this.isLessThanThreeMonths(validArgs.timeMin, validArgs.timeMax)) {
-      throw new McpError2(
-        ErrorCode2.InvalidRequest,
-        "The time gap between timeMin and timeMax must be less than 3 months"
+      throw localEnvelopeError(
+        "bad_request",
+        "The requested time range is longer than the three months Google allows for a free/busy query.",
+        `timeMin: ${validArgs.timeMin}, timeMax: ${validArgs.timeMax}`
       );
     }
     const selectedAccounts = this.getClientsForAccounts(args.account, accounts);
-    const mergedCalendars = await this.queryFreeBusyMultiAccount(selectedAccounts, validArgs);
+    const { calendars: mergedCalendars, warnings } = await this.queryFreeBusyMultiAccount(selectedAccounts, validArgs);
     const response = {
       timeMin: validArgs.timeMin,
       timeMax: validArgs.timeMax,
-      calendars: mergedCalendars
+      calendars: mergedCalendars,
+      ...warnings.length > 0 && { warnings }
     };
     return createStructuredResponse(response);
   }
   async queryFreeBusyMultiAccount(accounts, args) {
     const mergedCalendars = {};
     const calendarIds = args.calendars.map((c) => c.id);
+    const failureWarnings = [];
     let accountCalendarMap;
     const resolutionWarnings = [];
     if (accounts.size > 1) {
@@ -4421,13 +4634,14 @@ var FreeBusyEventHandler = class extends BaseToolHandler {
       accountCalendarMap = resolved;
       resolutionWarnings.push(...warnings);
       if (accountCalendarMap.size === 0) {
+        this.throwCalendarAccessFailureIfAny("read the free/busy information");
         for (const calId of calendarIds) {
           mergedCalendars[calId] = {
             busy: [],
             errors: [{ reason: "notFound" }]
           };
         }
-        return mergedCalendars;
+        return { calendars: mergedCalendars, warnings: [...resolutionWarnings] };
       }
     } else {
       const [accountId2] = accounts.keys();
@@ -4444,13 +4658,30 @@ var FreeBusyEventHandler = class extends BaseToolHandler {
           const result = await this.queryFreeBusy(client, filteredArgs);
           return { accountId: accountId2, result, error: null, calendarsQueried: calendarsForAccount };
         } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          process.stderr.write(`Warning: FreeBusy query failed for account "${accountId2}": ${message}
-`);
-          return { accountId: accountId2, result: null, error: message, calendarsQueried: calendarsForAccount };
+          return { accountId: accountId2, result: null, error, calendarsQueried: calendarsForAccount };
         }
       })
     );
+    const failed = results.filter((r) => r.error !== null);
+    if (failed.length > 0 && failed.length === results.length) {
+      throw this.toEnvelopeError(failed[0].error, "read the free/busy information");
+    }
+    for (const failure of failed) {
+      failureWarnings.push(
+        `Account "${failure.accountId}" could not be queried, so its calendars (${failure.calendarsQueried.join(", ")}) are missing from this answer: ` + envelopeTextFor(failure.error, `read free/busy for account "${failure.accountId}"`)
+      );
+    }
+    const unqueriedCalendars = /* @__PURE__ */ new Set();
+    for (const failure of failed) {
+      for (const calId of failure.calendarsQueried) {
+        unqueriedCalendars.add(calId);
+      }
+    }
+    for (const success of results.filter((r) => r.error === null)) {
+      for (const calId of success.calendarsQueried) {
+        unqueriedCalendars.delete(calId);
+      }
+    }
     for (const calId of calendarIds) {
       let bestResult = null;
       for (const { result } of results) {
@@ -4471,13 +4702,13 @@ var FreeBusyEventHandler = class extends BaseToolHandler {
       if (!bestResult) {
         mergedCalendars[calId] = {
           busy: [],
-          errors: [{ reason: "notFound" }]
+          errors: [{ reason: unqueriedCalendars.has(calId) ? "queryFailed" : "notFound" }]
         };
       } else {
         mergedCalendars[calId] = bestResult;
       }
     }
-    return mergedCalendars;
+    return { calendars: mergedCalendars, warnings: [...resolutionWarnings, ...failureWarnings] };
   }
   async queryFreeBusy(client, args) {
     try {
@@ -4503,7 +4734,7 @@ var FreeBusyEventHandler = class extends BaseToolHandler {
       });
       return response.data;
     } catch (error) {
-      throw this.handleGoogleApiError(error);
+      throw this.handleGoogleApiError(error, "read the free/busy information");
     }
   }
   isLessThanThreeMonths(timeMin, timeMax) {
@@ -4516,7 +4747,7 @@ var FreeBusyEventHandler = class extends BaseToolHandler {
 };
 
 // src/handlers/core/GetCurrentTimeHandler.ts
-import { McpError as McpError3, ErrorCode as ErrorCode3 } from "@modelcontextprotocol/sdk/types.js";
+import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 var GetCurrentTimeHandler = class extends BaseToolHandler {
   async runTool(args, accounts) {
     const validArgs = args;
@@ -4526,8 +4757,8 @@ var GetCurrentTimeHandler = class extends BaseToolHandler {
     let timezone;
     if (validArgs.timeZone) {
       if (!this.isValidTimeZone(validArgs.timeZone)) {
-        throw new McpError3(
-          ErrorCode3.InvalidRequest,
+        throw new McpError(
+          ErrorCode.InvalidRequest,
           `Invalid timezone: ${validArgs.timeZone}. Use IANA format (e.g. 'America/Los_Angeles').`
         );
       }
@@ -4699,19 +4930,24 @@ var RespondToEventHandler = class extends BaseToolHandler {
       });
       const event = eventResponse.data;
       if (!event) {
-        throw new Error("Event not found");
+        throw localEnvelopeError(
+          "unexpected_response",
+          `Google returned no event for id "${targetEventId}".`
+        );
       }
       const attendees = event.attendees || [];
       const selfAttendeeIndex = attendees.findIndex((a) => a.self === true);
       if (selfAttendeeIndex === -1) {
-        throw new Error(
-          "You are not an attendee of this event. Only attendees can respond to event invitations."
+        throw localEnvelopeError(
+          "not_an_attendee",
+          "The response was not recorded because this account is not an attendee of the event."
         );
       }
       const selfAttendee = attendees[selfAttendeeIndex];
       if (selfAttendee.organizer === true) {
-        throw new Error(
-          "You are the organizer of this event. Organizers do not respond to their own event invitations."
+        throw localEnvelopeError(
+          "is_organizer",
+          "The response was not recorded because this account is the organizer of the event."
         );
       }
       const updatedAttendees = [...attendees];
@@ -4730,7 +4966,7 @@ var RespondToEventHandler = class extends BaseToolHandler {
         sendUpdates: actualSendUpdates
       });
       if (!updateResponse.data) {
-        throw new Error("Failed to update event response");
+        throw localEnvelopeError("unexpected_response", "Google accepted the response but returned nothing.");
       }
       let message = `Your response has been set to "${validArgs.response}"`;
       if (validArgs.modificationScope === "thisEventOnly") {
@@ -4749,10 +4985,10 @@ var RespondToEventHandler = class extends BaseToolHandler {
       };
       return createStructuredResponse(response);
     } catch (error) {
-      if (error instanceof RecurringEventError) {
+      if (isEnvelopeError(error)) {
         throw error;
       }
-      throw this.handleGoogleApiError(error);
+      throw this.handleGoogleApiError(error, `respond to event "${validArgs.eventId}"`);
     }
   }
 };
@@ -5399,8 +5635,10 @@ var ToolRegistry = class {
             }
             processedCalendarId = parsed;
           } catch (error) {
-            throw new Error(
-              `Invalid JSON format for calendarId: ${error instanceof Error ? error.message : "Unknown parsing error"}`
+            throw localEnvelopeError(
+              "bad_request",
+              "The calendarId argument was not a calendar id or a list of calendar ids.",
+              error instanceof Error ? error.message : void 0
             );
           }
         }
@@ -5599,11 +5837,15 @@ var ToolRegistry = class {
         annotations: tool.annotations
       },
       async (args) => {
-        const normalizedArgs = this.normalizeDateTimeFields(tool.name, args);
-        const validatedArgs = tool.schema.parse(normalizedArgs);
-        const processedArgs = tool.handlerFunction ? await tool.handlerFunction(validatedArgs) : validatedArgs;
-        const handler = new tool.handler();
-        return executeWithHandler(handler, processedArgs);
+        try {
+          const normalizedArgs = this.normalizeDateTimeFields(tool.name, args);
+          const validatedArgs = tool.schema.parse(normalizedArgs);
+          const processedArgs = tool.handlerFunction ? await tool.handlerFunction(validatedArgs) : validatedArgs;
+          const handler = new tool.handler();
+          return await executeWithHandler(handler, processedArgs);
+        } catch (error) {
+          return toEnvelopeResult(error, `run ${tool.name}`);
+        }
       }
     );
   }
@@ -5611,7 +5853,6 @@ var ToolRegistry = class {
 
 // src/handlers/core/ManageAccountsHandler.ts
 init_paths();
-import { McpError as McpError4, ErrorCode as ErrorCode4 } from "@modelcontextprotocol/sdk/types.js";
 import { google as google4 } from "googleapis";
 var ManageAccountsHandler = class {
   async runTool(args, context) {
@@ -5623,8 +5864,8 @@ var ManageAccountsHandler = class {
       case "remove":
         return this.removeAccount(args.account_id, context);
       default:
-        throw new McpError4(
-          ErrorCode4.InvalidRequest,
+        throw localEnvelopeError(
+          "bad_request",
           `Invalid action: ${args.action}. Must be 'list', 'add', or 'remove'.`
         );
     }
@@ -5637,9 +5878,10 @@ var ManageAccountsHandler = class {
       const client = accounts.get(normalizedId);
       if (!client) {
         const availableAccounts = Array.from(accounts.keys()).join(", ") || "none";
-        throw new McpError4(
-          ErrorCode4.InvalidRequest,
-          `Account "${normalizedId}" not found. Available accounts: ${availableAccounts}`
+        throw localEnvelopeError(
+          "account_not_found",
+          `There is no connected account called "${normalizedId}".`,
+          `Connected accounts: ${availableAccounts}`
         );
       }
       const accountInfo = await this.getAccountInfo(normalizedId, client);
@@ -5675,11 +5917,12 @@ var ManageAccountsHandler = class {
         const info = await this.getAccountInfo(accId, client);
         accountInfos.push(info);
       } catch (error) {
-        errors.push(`${accId}: ${error instanceof Error ? error.message : "Unknown error"}`);
+        const envelope = envelopeTextFor(error, `read account "${accId}"`);
+        errors.push(`${accId}: ${envelope}`);
         accountInfos.push({
           account_id: accId,
           status: "error",
-          error: error instanceof Error ? error.message : "Failed to fetch account details"
+          error: envelope
         });
       }
     }
@@ -5718,29 +5961,39 @@ var ManageAccountsHandler = class {
         token_expiry: expiryDate ? new Date(expiryDate).toISOString() : void 0
       };
     } catch (error) {
-      const credentials = client.credentials;
-      return {
-        account_id: accountId2,
-        status: credentials.refresh_token ? "active" : "invalid",
-        error: error instanceof Error ? error.message : "Failed to verify account"
-      };
+      const response = error?.response;
+      if (typeof response?.status === "number") {
+        throw httpEnvelopeError({
+          action: `read account "${accountId2}"`,
+          status: response.status,
+          statusText: response.statusText,
+          body: response.data
+        });
+      }
+      if (isEnvelopeError(error)) throw error;
+      throw localEnvelopeError(
+        "internal_error",
+        `Account "${accountId2}" could not be read.`,
+        error instanceof Error ? error.message : String(error)
+      );
     }
   }
   // ============ ADD ACTION ============
   async addAccount(accountId2, context) {
     if (!accountId2) {
-      throw new McpError4(
-        ErrorCode4.InvalidRequest,
-        "account_id is required for 'add' action. Provide a nickname like 'work' or 'personal' to identify this account."
+      throw localEnvelopeError(
+        "bad_request",
+        "account_id is required for the 'add' action."
       );
     }
     const normalizedId = accountId2.toLowerCase();
     try {
       validateAccountId(normalizedId);
     } catch (error) {
-      throw new McpError4(
-        ErrorCode4.InvalidRequest,
-        error instanceof Error ? error.message : "Invalid account nickname format"
+      throw localEnvelopeError(
+        "bad_request",
+        "The account nickname is not a valid account nickname.",
+        error instanceof Error ? error.message : void 0
       );
     }
     if (context.accounts.has(normalizedId)) {
@@ -5761,9 +6014,10 @@ var ManageAccountsHandler = class {
     try {
       const started = await context.authServer.startForMcpTool(normalizedId);
       if (!started.success) {
-        throw new McpError4(
-          ErrorCode4.InternalError,
-          started.error || "Failed to start authentication server"
+        throw localEnvelopeError(
+          "auth_server_failed",
+          "The authentication server could not be started.",
+          started.error
         );
       }
       const response = {
@@ -5782,44 +6036,47 @@ var ManageAccountsHandler = class {
         }]
       };
     } catch (error) {
-      if (error instanceof McpError4) {
+      if (isEnvelopeError(error)) {
         throw error;
       }
-      throw new McpError4(
-        ErrorCode4.InternalError,
-        `Failed to start authentication: ${error instanceof Error ? error.message : "Unknown error"}`
+      throw localEnvelopeError(
+        "auth_server_failed",
+        "Authentication could not be started.",
+        error instanceof Error ? error.message : String(error)
       );
     }
   }
   // ============ REMOVE ACTION ============
   async removeAccount(accountId2, context) {
     if (!accountId2) {
-      throw new McpError4(
-        ErrorCode4.InvalidRequest,
-        "account_id is required for 'remove' action. Specify the nickname of the account to remove."
+      throw localEnvelopeError(
+        "bad_request",
+        "account_id is required for the 'remove' action."
       );
     }
     const normalizedId = accountId2.toLowerCase();
     try {
       validateAccountId(normalizedId);
     } catch (error) {
-      throw new McpError4(
-        ErrorCode4.InvalidRequest,
-        error instanceof Error ? error.message : "Invalid account nickname format"
+      throw localEnvelopeError(
+        "bad_request",
+        "The account nickname is not a valid account nickname.",
+        error instanceof Error ? error.message : void 0
       );
     }
     const accounts = await context.reloadAccounts();
     if (!accounts.has(normalizedId)) {
       const availableAccounts = Array.from(accounts.keys()).join(", ") || "none";
-      throw new McpError4(
-        ErrorCode4.InvalidRequest,
-        `Account "${normalizedId}" not found. Available accounts: ${availableAccounts}`
+      throw localEnvelopeError(
+        "account_not_found",
+        `There is no connected account called "${normalizedId}".`,
+        `Connected accounts: ${availableAccounts}`
       );
     }
     if (accounts.size === 1) {
-      throw new McpError4(
-        ErrorCode4.InvalidRequest,
-        `Cannot remove the last authenticated account. Use action 'add' to connect another account first, then remove this one.`
+      throw localEnvelopeError(
+        "last_account",
+        `Account "${normalizedId}" was not removed because it is the only connected account.`
       );
     }
     try {
@@ -5839,9 +6096,13 @@ var ManageAccountsHandler = class {
         }]
       };
     } catch (error) {
-      throw new McpError4(
-        ErrorCode4.InternalError,
-        `Failed to remove account: ${error instanceof Error ? error.message : "Unknown error"}`
+      if (isEnvelopeError(error)) {
+        throw error;
+      }
+      throw localEnvelopeError(
+        "internal_error",
+        `Account "${normalizedId}" could not be removed.`,
+        error instanceof Error ? error.message : String(error)
       );
     }
   }
@@ -6316,7 +6577,11 @@ var GoogleCalendarMcpServer = class {
         }
       },
       async (args) => {
-        return manageAccountsHandler.runTool(args, serverContext);
+        try {
+          return await manageAccountsHandler.runTool(args, serverContext);
+        } catch (error) {
+          return toEnvelopeResult(error, "manage the connected accounts");
+        }
       }
     );
   }
@@ -6476,12 +6741,9 @@ Do not create an event before confirmation.`
             ]
           };
         } catch (error) {
-          if (error instanceof McpError5) {
-            throw error;
-          }
-          throw new McpError5(
-            ErrorCode5.InternalError,
-            `Failed to load calendar accounts: ${error instanceof Error ? error.message : String(error)}`
+          throw new McpError2(
+            ErrorCode2.InternalError,
+            envelopeTextFor(error, "load the connected accounts")
           );
         }
       }
@@ -6501,27 +6763,28 @@ Do not create an event before confirmation.`
       }
     }
     if (this.config.transport.type === "stdio") {
-      throw new McpError5(
-        ErrorCode5.InvalidRequest,
-        "Authentication tokens are no longer valid. Please restart the server to re-authenticate."
+      throw localEnvelopeError(
+        "no_credentials",
+        "The stored Google credentials are no longer valid."
       );
     }
     try {
       const authSuccess = await this.authServer.start(false);
       if (!authSuccess) {
-        throw new McpError5(
-          ErrorCode5.InvalidRequest,
-          "Authentication required. Please run 'npm run auth' to authenticate, or visit the auth URL shown in the logs for HTTP mode."
+        throw localEnvelopeError(
+          "no_credentials",
+          "No Google account is connected and the authentication server could not be started."
         );
       }
     } catch (error) {
-      if (error instanceof McpError5) {
+      if (isEnvelopeError(error)) {
         throw error;
       }
-      if (error instanceof Error) {
-        throw new McpError5(ErrorCode5.InvalidRequest, error.message);
-      }
-      throw new McpError5(ErrorCode5.InvalidRequest, "Authentication required. Please run 'npm run auth' to authenticate.");
+      throw localEnvelopeError(
+        "no_credentials",
+        "No Google account is connected and authentication could not be started.",
+        error instanceof Error ? error.message : String(error)
+      );
     }
   }
   async executeWithHandler(handler, args) {

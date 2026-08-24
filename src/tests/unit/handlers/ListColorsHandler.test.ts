@@ -267,16 +267,16 @@ describe('ListColorsHandler', () => {
 
       // Mock handleGoogleApiError to throw a specific error
       vi.spyOn(handler as any, 'handleGoogleApiError').mockImplementation(() => {
-        throw new Error('Failed to retrieve colors');
+        throw new Error('[unexpected_response] Google returned no colours.');
       });
 
-      await expect(handler.runTool({}, mockSingleAccount)).rejects.toThrow('Failed to retrieve colors');
+      await expect(handler.runTool({}, mockSingleAccount)).rejects.toThrow('[unexpected_response] Google returned no colours.');
     });
 
     it('should handle null response data', async () => {
       mockCalendar.colors.get.mockResolvedValue({ data: null });
 
-      await expect(handler.runTool({}, mockSingleAccount)).rejects.toThrow('Failed to retrieve colors');
+      await expect(handler.runTool({}, mockSingleAccount)).rejects.toThrow('[unexpected_response] Google returned no colours.');
     });
 
     it('should handle permission denied error', async () => {

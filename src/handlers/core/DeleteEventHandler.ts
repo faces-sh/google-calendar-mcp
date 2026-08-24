@@ -44,7 +44,7 @@ export class DeleteEventHandler extends BaseToolHandler {
                 sendUpdates: args.sendUpdates,
             });
         } catch (error) {
-            throw this.handleGoogleApiError(error);
+            throw this.handleGoogleApiError(error, `delete event "${args.eventId}"`);
         }
     }
 }
